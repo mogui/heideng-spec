@@ -739,9 +739,9 @@ git diff --stat main...heideng/<slug>
 | `heideng resolve <id> "note"` | closes an escalation with a decision | - |
 | `heideng pause [run]` / `heideng abort [run]` | write to `control.jsonl` | - |
 | `heideng close <run>` | closes a stopped run and releases the lock; with `--delete-branch` moves the spec's holdout to `retired/` | `--delete-branch` |
-| `heideng status` | active run, open escalations | `--all` |
+| `heideng status` | active run, open escalations | `--all`, `--json` |
 | `heideng ui [run]` | opens the UI | `--port` |
-| `heideng stats` | aggregated costs across runs | - |
+| `heideng stats` | aggregated costs across runs | `--json` |
 | `heideng clean` | cleanup | `--dry-run` |
 
 An optional skill helps write the first `contract.md`.
@@ -756,6 +756,84 @@ Exit codes of `run` and `resume`:
 | 3 | manual abort |
 | 4 | engine error |
 | 5 | run rejected (invalid spec lock, run already active) |
+
+Exit codes of the other commands: 0 success, 3 `accept` closed by the person without confirmation, 4 engine error, 5 rejected (invalid arguments, unknown id, unmet precondition, `accept` without TTY).
+
+### Output
+
+Common rules:
+- Results go to stdout; live feedback, warnings and errors go to stderr.
+- An error is two lines: `error: <what>` and `-> <command or file that resolves it>` (e.g. `error: spec.lock differs from acceptance.md` / `-> heideng accept notes-sharing`).
+- With a TTY the output uses colors and redraws in place. Without a TTY or with `NO_COLOR` it has no colors and no redraw: the live area becomes one line per event (see below).
+- `--json` on `status` and `stats` prints a single JSON document on stdout.
+
+#### Live area: `run`, `resume`
+
+During the run stderr shows a live area that the CLI redraws in place, with the current state only:
+
+```
+heideng notes-sharing  run 2026-10-17-a  UI http://127.0.0.1:4317/?t=...
+ROUND 2/5  wave 1  $14.06/50  2h38/6h00  stall 0/2  escalations 0
+ ⠋ implement F-1 fix notes-03 (v2)   Bash: npm test -- notes          3m12  $0.84
+ ⠋ implement T-07 Search (v1)        Edit src/search/index.ts         5m40  $1.12
+ ⠋ wave-test                         waiting for 2 tickets
+last: merge T-02 ok 9f3c2a1
+```
+
+- Line 1: spec, run, UI URL with token (without `--no-ui`: no URL). It stays fixed for the whole run.
+- Line 2: round and wave, the `usd_per_run`, `wall_clock` and `stall_rounds` budgets, open escalations. Cost updates on every `cost` event.
+- One line per running node: spinner, `exec` in readable form (node, ticket, title, visit), current activity, elapsed time, node cost. The line disappears when the node ends.
+- Activity of an llm node: the last message of `stream.jsonl`, as tool and main argument (`Edit src/search/index.ts`, `Bash: npm test -- notes`, `Skill /tdd`) or the first line of the assistant text, truncated to the terminal width. On `needs_input`: `asking <answerer>: <first question>`.
+- Activity of a tool node: its current step (`replay notes-03 2/9`, `bisect 2/4`, `build heideng-notes:3fa1`, `seed`).
+- `last:` the last event among `merge`, `bisect`, `verdict`, `ticket.status`, `stop`, `escalation`, `control`.
+- The spinner advances at 10 fps; the text changes on every new message of the streams and every event.
+- Without a TTY: one line per `node.start`, `node.end`, `merge`, `bisect`, `verdict`, `stop`, `escalation`, `control` event, in the form `<time> <exec> <event> <outcome> <cost>`.
+
+#### End of run: `run`, `resume`
+
+At the end the CLI clears the live area and prints on stdout:
+
+```
+heideng notes-sharing  run 2026-10-17-a  stopped: max_rounds
+Branch heideng/notes-sharing  round 5/5  $48.20/50  5h51/6h00
+Holdout 11/14 pass  3 fail_product  |  tickets 12 merged, 1 failed  |  $4.38 per verified AC
+
+To do for you
+- [ ] T-06 escalation: <reason> -> heideng resolve T-06 "..." | edit contract
+- [ ] uncovered decision (T-01): <text>
+
+Inspect
+  report       ~/.heideng/notes-sharing/runs/2026-10-17-a/report.md
+  UI           heideng ui 2026-10-17-a
+  escalations  ~/.heideng/notes-sharing/runs/2026-10-17-a/escalations/
+  diff         git diff --stat main...heideng/notes-sharing
+  next         heideng resume 2026-10-17-a --add-rounds 2
+```
+
+- Line 1: outcome as in `report.md` (`merged <sha>`, `stopped: <reason>`, `aborted`, `failed`).
+- "To do for you" is the same list as the report; without items the section is absent.
+- "Inspect" lists the report path, the UI command, the escalations path if any, the diff of the branch and the next command consistent with the outcome (`resume` with the extension for the exhausted budget, `resolve`, `close`). On `merged`: the merge sha in place of the diff and no next command.
+- The exit code follows the table above.
+
+#### `accept`
+
+- During the gate's work stderr shows the live area with the gate node only.
+- On `needs_input` the CLI prints the gaps and questions numbered, each with the proposal. For each one the person presses Enter to confirm the proposal or writes the correction; then the session resumes and the live area returns.
+- Before the commit the CLI shows the summary and asks for confirmation (`y/n`): ACs with id and one line each, superseded ACs, contract delta per section (Run, Drive, Observe).
+- After the commit it prints on stdout: branch, commit sha, `spec.lock` version, paths of `spec.md`, `acceptance.md` and `contract.md`, next command `heideng run <spec>`.
+
+#### Other commands
+
+| Command | Output |
+|---|---|
+| `init` | detected stack, package manager and commands; created files, each with its path; skipped files that already exist (overwritten with `--force`); a warning for an `AGENTS.md` not included by `CLAUDE.md`, with the line to add |
+| `pause`, `abort`, `resume` with a live engine | writes `control.jsonl` and prints `requested`; then shows the live area until the `control` event with `phase: applied` and prints `applied`. Ctrl-C detaches the CLI and the request stays valid |
+| `resolve` | closed escalation, note written to `decisions.md`, tickets back to `queued`, next command `heideng resume <run>` |
+| `close` | closed run, lock released, clones removed, with `--delete-branch` the deleted branch and the scenarios moved to `retired/` |
+| `status` | active run with state, round, cost and budgets, running nodes; table of open escalations (run, id, reason, command to close it); `--all` adds the closed runs |
+| `ui` | URL with token |
+| `stats` | table per run (spec, outcome, cost, verified ACs, cost per verified AC) and the project total |
+| `clean` | removed items per category (containers, networks, clones, images) with freed space; with `--dry-run` the same list with nothing removed |
 
 ## Config
 
