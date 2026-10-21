@@ -1,0 +1,615 @@
+<!doctype html>
+<!--
+  PROTOTYPE - throwaway. Non e' codice di produzione.
+  Domanda: come dovrebbe apparire `df ui` (SPEC.md, sezione "UI locale")?
+  Tre varianti radicalmente diverse sulla stessa pagina, switch con ?variant=A|B|C (barra in basso o frecce).
+  ?mode=live (run in corso, dati che scorrono) | ?mode=done (mattino dopo, run fermato per stall).
+  Dati finti, nessuna persistenza, azioni (pausa/resume/abort) solo stub in memoria.
+  Avvio: open prototypes/df-ui.html  (serve rete per Preact+htm da unpkg)
+-->
+<html lang="it">
+<head>
+<meta charset="utf-8">
+<title>PROTOTYPE df ui</title>
+<style>
+  :root {
+    --bg:#0f1115; --panel:#171a21; --panel2:#1d212a; --border:#262b36; --text:#d6dae3; --muted:#7d8596;
+    --pending:#4b5263; --running:#3b82f6; --ok:#22c55e; --fail:#ef4444; --esc:#eab308; --budget:#a855f7;
+    --tested:#14b8a6; --contract:#f97316;
+  }
+  * { box-sizing:border-box; }
+  html,body { margin:0; height:100%; background:var(--bg); color:var(--text);
+    font:13px/1.4 ui-sans-serif, -apple-system, "Segoe UI", sans-serif; }
+  .mono { font-family: ui-monospace, "SF Mono", Menlo, monospace; }
+  .muted { color:var(--muted); }
+  .panel { background:var(--panel); border:1px solid var(--border); border-radius:6px; overflow:hidden; display:flex; flex-direction:column; min-height:0; }
+  .panel > h3 { margin:0; padding:6px 10px; font-size:11px; letter-spacing:.06em; text-transform:uppercase; color:var(--muted); border-bottom:1px solid var(--border); display:flex; gap:8px; align-items:center; }
+  .panel > .body { padding:8px 10px; overflow:auto; min-height:0; flex:1; }
+  button { background:var(--panel2); color:var(--text); border:1px solid var(--border); border-radius:4px; padding:3px 8px; cursor:pointer; font:inherit; }
+  button:hover { border-color:#3a4150; }
+  button.on { background:#2a3140; border-color:#4b5263; }
+  .pill { display:inline-block; padding:0 6px; border-radius:9px; font-size:11px; line-height:17px; white-space:nowrap; }
+  .dot { display:inline-block; width:8px; height:8px; border-radius:50%; margin-right:5px; vertical-align:middle; }
+  .bar { height:6px; background:#262b36; border-radius:3px; overflow:hidden; width:110px; display:inline-block; vertical-align:middle; }
+  .bar > i { display:block; height:100%; }
+  table { border-collapse:collapse; width:100%; }
+  td, th { padding:3px 6px; text-align:left; border-bottom:1px solid var(--border); vertical-align:top; }
+  th { color:var(--muted); font-weight:500; font-size:11px; }
+  pre { margin:0; white-space:pre-wrap; word-break:break-word; font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size:12px; }
+  .tabs { display:flex; gap:2px; border-bottom:1px solid var(--border); padding:0 6px; }
+  .tabs button { border:none; border-bottom:2px solid transparent; border-radius:0; background:none; color:var(--muted); padding:6px 10px; }
+  .tabs button.on { color:var(--text); border-bottom-color:var(--running); }
+  .clickable { cursor:pointer; }
+  .clickable:hover { background:#20252f; }
+  .sel { outline:1px solid var(--running); background:#1b2433 !important; }
+
+  /* switcher (non fa parte del design) */
+  #switcher { position:fixed; bottom:14px; left:50%; transform:translateX(-50%); z-index:999;
+    background:#fff; color:#111; border-radius:999px; padding:6px 10px; display:flex; gap:8px; align-items:center;
+    box-shadow:0 6px 24px rgba(0,0,0,.5); font:12px ui-monospace, Menlo, monospace; }
+  #switcher button { background:#eee; color:#111; border:1px solid #ccc; border-radius:999px; padding:2px 10px; }
+  #switcher button.on { background:#111; color:#fff; }
+  #switcher .lbl { min-width:190px; text-align:center; font-weight:600; }
+  #statebox { position:fixed; bottom:60px; left:50%; transform:translateX(-50%); width:min(900px,92vw); max-height:50vh; overflow:auto;
+    background:#fff; color:#111; border-radius:8px; padding:10px; z-index:998; box-shadow:0 6px 24px rgba(0,0,0,.5); }
+  #statebox pre { font-size:11px; }
+</style>
+</head>
+<body>
+<div id="app"></div>
+<script type="module">
+import { html, render, useState, useEffect } from 'https://unpkg.com/htm@3/preact/standalone.module.js';
+
+/* ------------------------------------------------------------------ dati finti */
+
+const T0 = 22 * 60 + 4; // run partito alle 22:04
+const clock = m => { const t = (T0 + Math.floor(m)) % 1440; return String(Math.floor(t / 60)).padStart(2, '0') + ':' + String(t % 60).padStart(2, '0'); };
+const usd = n => '$' + n.toFixed(2);
+const dur = m => `${Math.floor(m / 60)}h${String(Math.floor(m % 60)).padStart(2, '0')}`;
+
+const COLORS = {
+  pending: 'var(--pending)', queued: 'var(--pending)', running: 'var(--running)', implementing: 'var(--running)',
+  tested: 'var(--tested)', ok: 'var(--ok)', merged: 'var(--ok)', fail: 'var(--fail)', failed: 'var(--fail)',
+  escalated: 'var(--esc)', esc: 'var(--esc)', budget: 'var(--budget)', skipped: 'var(--pending)',
+  pass: 'var(--ok)', fail_product: 'var(--fail)', fail_contract: 'var(--contract)', harness_gap: 'var(--tested)', unknown: 'var(--esc)',
+};
+const VERDICT_SHORT = { pass: 'pass', fail_product: 'product', fail_contract: 'contract', harness_gap: 'h-gap', unknown: '?' };
+
+function baseData() {
+  return {
+    run: { id: '2026-10-17-a', project: 'notes-app', spec: 'notes-sharing', branch: 'df/notes-sharing', status: 'running',
+      round: 2, maxRounds: 5, wave: 1, cost: 14.06, budget: 50, elapsed: 158, wall: 360, stall: 0, stallMax: 2, stopReason: null },
+    pipe: [
+      { id: 'spec-gate', type: 'human', status: 'ok' },
+      { id: 'holdout-gen', type: 'llm', status: 'ok', cost: 3.10, harness: 'claude/opus', oracle: 'codex/gpt-5.3' },
+      { id: 'tickets', type: 'llm', status: 'ok', cost: 0.74, harness: 'claude/sonnet', oracle: 'codex/gpt-5.3' },
+      { id: 'regression', type: 'tool', status: 'pending' },
+      { id: 'merge-main', type: 'tool', status: 'pending' },
+      { id: 'report', type: 'tool', status: 'pending' },
+    ],
+    roundNodes: { clone: 'ok', implement: 'running', test: 'running', merge: 'pending', 'wave-test': 'pending',
+      review: 'pending', verify: 'pending', ledger: 'pending', route: 'pending' },
+    tickets: [
+      { id: 'T-1', title: 'Modello Note + migrazione', status: 'merged', visit: 1, cost: 0.62, deps: [], round: 1, wave: 1, ac: ['AC-1'] },
+      { id: 'T-2', title: 'API CRUD note', status: 'merged', visit: 2, cost: 1.34, deps: ['T-1'], round: 1, wave: 2, ac: ['AC-1', 'AC-2'] },
+      { id: 'T-3', title: 'Lista note (UI)', status: 'merged', visit: 1, cost: 0.71, deps: ['T-1'], round: 1, wave: 2, ac: ['AC-3'] },
+      { id: 'T-4', title: 'Condivisione via link', status: 'merged', visit: 1, cost: 0.88, deps: ['T-2'], round: 1, wave: 3, ac: ['AC-4'] },
+      { id: 'T-7', title: 'Ricerca full-text', status: 'failed', visit: 3, cost: 1.95, deps: ['T-2'], round: 1, wave: 3, ac: ['AC-7'], note: 'max_visits: test rossi (timeout su indice FTS)' },
+      { id: 'T-5', title: 'Permessi sola lettura', status: 'merged', visit: 3, cost: 2.10, deps: ['T-4'], round: 1, wave: 4, ac: ['AC-5'], note: 'v2: conflitto con T-4' },
+      { id: 'T-6', title: 'Notifica email al destinatario', status: 'escalated', visit: 1, cost: 0.44, deps: ['T-4'], round: 1, wave: 4, ac: ['AC-6'], note: 'blocked: invio email richiede SMTP, non presente in contract.md' },
+      { id: 'F-1', title: 'fix notes-03: link scaduto risponde 200', kind: 'fix', status: 'implementing', visit: 2, cost: 0.52, deps: [], round: 2, wave: 1, ac: ['AC-4'] },
+      { id: 'F-2', title: 'fix notes-05: elemento share-revoke mancante', kind: 'fix', status: 'tested', visit: 1, cost: 0.21, deps: [], round: 2, wave: 1, ac: ['AC-5'] },
+      { id: 'F-3', title: 'fix notes-07: ricerca senza risultati', kind: 'fix', status: 'implementing', visit: 1, cost: 0.33, deps: [], round: 2, wave: 1, ac: ['AC-7'] },
+      { id: 'R-1', title: 'review: estrarre validazione token', kind: 'review', status: 'implementing', visit: 1, cost: 0.18, deps: [], round: 2, wave: 1, ac: [] },
+      { id: 'R-2', title: 'review: query N+1 nella lista note', kind: 'review', status: 'queued', visit: 0, cost: 0, deps: ['R-1'], round: 2, wave: 2, ac: [] },
+    ],
+    scen: [
+      { id: 'notes-01', ac: ['AC-1'], title: 'Crea nota e la ritrova in lista', replay: true, r: ['pass'] },
+      { id: 'notes-02', ac: ['AC-2'], title: 'Modifica e cancella nota', replay: true, r: ['pass'] },
+      { id: 'notes-03', ac: ['AC-4'], title: 'Link scaduto non apre la nota', replay: true, r: ['fail_product'], reason: 'GET /s/:token scaduto -> 200, atteso 410' },
+      { id: 'notes-04', ac: ['AC-3'], title: 'Lista ordinata per data', replay: true, r: ['pass'] },
+      { id: 'notes-05', ac: ['AC-5'], title: 'Revoca condivisione', replay: true, r: ['fail_contract'], reason: 'getByTestId("share-revoke") non trovato' },
+      { id: 'notes-06', ac: ['AC-6'], title: 'Email al destinatario', replay: false, r: ['unknown'], reason: 'nessuna evidenza di invio (T-6 escalated)' },
+      { id: 'notes-07', ac: ['AC-7'], title: 'Ricerca per testo', replay: true, r: ['fail_product'], reason: 'ricerca "budget": 0 risultati, attesi 2' },
+      { id: 'notes-08', ac: ['AC-5'], title: 'Utente read-only non modifica', replay: false, r: ['pass'], gap: [1], reason: 'R1: harness_gap (seed utente mancante), riparato e rieseguito' },
+    ],
+    timeline: [
+      { lane: 'holdout-gen', s: 0, e: 14, st: 'ok' }, { lane: 'holdout-gen', s: 14, e: 18, st: 'ok', label: 'oracle' },
+      { lane: 'tickets', s: 18, e: 22, st: 'ok' }, { lane: 'tickets', s: 22, e: 25, st: 'ok', label: 'oracle' },
+      { lane: 'T-1', s: 25, e: 36, st: 'ok' }, { lane: 'merge', s: 36, e: 37, st: 'ok' }, { lane: 'wave-test', s: 37, e: 39, st: 'ok' },
+      { lane: 'T-2', s: 39, e: 50, st: 'fail' }, { lane: 'T-2', s: 50, e: 58, st: 'ok' }, { lane: 'T-3', s: 39, e: 49, st: 'ok' },
+      { lane: 'merge', s: 58, e: 59, st: 'ok' }, { lane: 'wave-test', s: 59, e: 61, st: 'ok' },
+      { lane: 'T-4', s: 61, e: 70, st: 'ok' }, { lane: 'T-7', s: 61, e: 68, st: 'fail' }, { lane: 'T-7', s: 68, e: 75, st: 'fail' }, { lane: 'T-7', s: 75, e: 82, st: 'fail' },
+      { lane: 'merge', s: 82, e: 83, st: 'ok' }, { lane: 'wave-test', s: 83, e: 85, st: 'ok' },
+      { lane: 'T-5', s: 85, e: 92, st: 'fail' }, { lane: 'T-5', s: 92, e: 97, st: 'fail', label: 'conflitto' }, { lane: 'T-5', s: 97, e: 104, st: 'ok' },
+      { lane: 'T-6', s: 85, e: 89, st: 'esc' },
+      { lane: 'merge', s: 104, e: 105, st: 'ok' }, { lane: 'wave-test', s: 105, e: 107, st: 'ok' },
+      { lane: 'review', s: 107, e: 118, st: 'ok' }, { lane: 'verify', s: 118, e: 139, st: 'fail' }, { lane: 'ledger', s: 139, e: 141, st: 'ok' },
+      { lane: 'F-1', s: 141, e: 150, st: 'fail' }, { lane: 'F-1', s: 150, e: null, st: 'running' },
+      { lane: 'F-2', s: 141, e: 147, st: 'ok' }, { lane: 'F-3', s: 146, e: null, st: 'running' }, { lane: 'R-1', s: 148, e: null, st: 'running' },
+    ],
+    rounds: [{ n: 1, s: 25, e: 141 }, { n: 2, s: 141, e: null }],
+    events: [
+      [0, 'run.start', 'spec notes-sharing, spec.lock valido'],
+      [14, 'node.end', 'holdout-gen ok: 8 scenari, 6 replay, check tool verdi'],
+      [18, 'node.end', 'oracle holdout: 7/7 AC coperti, 1 giro'],
+      [25, 'node.end', 'tickets: 7 ticket, graph-check ok, oracle ok'],
+      [36, 'ticket.status', 'T-1 merged'],
+      [50, 'ticket.status', 'T-2 test rossi -> visit 2'],
+      [58, 'ticket.status', 'T-2, T-3 merged'],
+      [82, 'ticket.status', 'T-7 failed (max_visits 3)'],
+      [89, 'escalation', 'T-6 blocked: SMTP non nel contratto'],
+      [92, 'merge', 'T-5 conflitto con T-4 -> requeue visit 2'],
+      [104, 'ticket.status', 'T-5 merged'],
+      [118, 'node.end', 'review: 1 commit (test verdi), 2 note -> R-1, R-2'],
+      [124, 'harness_gap', 'notes-08: doctor senza seed utente -> riparato verify/, rieseguito'],
+      [139, 'verdict', 'verify R1: 4 pass, 2 fail_product, 1 fail_contract, 1 unknown'],
+      [141, 'round', 'round 2: 3 fix ticket + 2 ticket review in coda'],
+      [150, 'ticket.status', 'F-1 test rossi -> visit 2'],
+    ],
+    decisions: [
+      { by: 'T-1', text: 'SQLite (better-sqlite3): il contratto non specifica il DB', uncovered: true },
+      { by: 'T-2', text: 'Token di condivisione 32 byte base64url, scadenza default 7 giorni', uncovered: true },
+      { by: 'T-4', text: 'Route pubblica /s/:token separata dall\'API autenticata' },
+      { by: 'T-5', text: 'Ruolo read-only come flag sulla condivisione, non sull\'utente' },
+      { by: 'review', text: 'Validazione token da estrarre in un modulo (-> R-1)' },
+    ],
+    merges: [
+      { sha: 'a41c9e2', t: 'T-1', wave: '1.1', ok: true }, { sha: '7be0d13', t: 'T-2', wave: '1.2', ok: true }, { sha: 'c09f5aa', t: 'T-3', wave: '1.2', ok: true },
+      { sha: '1d77b40', t: 'T-4', wave: '1.3', ok: true }, { sha: null, t: 'T-5', wave: '1.4', ok: false, note: 'conflitto con T-4 su src/share/routes.ts -> abort, requeue' },
+      { sha: '9e3a2c1', t: 'T-5', wave: '1.4', ok: true }, { sha: 'f2c8810', t: 'review', wave: 'R1', ok: true },
+    ],
+    stops: [],
+  };
+}
+
+function doneData() {
+  const d = baseData();
+  Object.assign(d.run, { status: 'stopped', round: 3, wave: 2, cost: 27.80, elapsed: 312, stall: 2,
+    stopReason: 'stall_rounds: stessi scenari falliti (notes-06, notes-07) per 2 round' });
+  d.pipe.find(p => p.id === 'regression').status = 'skipped';
+  d.pipe.find(p => p.id === 'merge-main').status = 'skipped';
+  d.pipe.find(p => p.id === 'report').status = 'ok';
+  Object.keys(d.roundNodes).forEach(k => d.roundNodes[k] = 'ok');
+  d.roundNodes.verify = 'fail'; d.roundNodes.route = 'esc';
+  const set = (id, o) => Object.assign(d.tickets.find(t => t.id === id), o);
+  set('F-1', { status: 'merged', visit: 2, cost: 0.97 }); set('F-2', { status: 'merged' }); set('R-1', { status: 'merged', cost: 0.41 });
+  set('R-2', { status: 'merged', visit: 1, cost: 0.66 });
+  set('F-3', { status: 'merged', cost: 0.80, note: 'merged, ma notes-07 ancora rosso in R2' });
+  d.tickets.push(
+    { id: 'F-4', title: 'fix notes-07: ricerca case-insensitive', kind: 'fix', status: 'failed', visit: 3, cost: 2.40, deps: [], round: 3, wave: 1, ac: ['AC-7'], note: 'max_visits: FTS5 non disponibile nell\'immagine' },
+    { id: 'F-5', title: 'fix notes-06: evidenza invio email', kind: 'fix', status: 'escalated', visit: 1, cost: 0.30, deps: ['T-6'], round: 3, wave: 1, ac: ['AC-6'], note: 'blocked: dipende da T-6 escalated' },
+  );
+  const r = { 'notes-01': ['pass', 'pass', 'pass'], 'notes-02': ['pass', 'pass', 'pass'], 'notes-03': ['fail_product', 'pass', 'pass'],
+    'notes-04': ['pass', 'pass', 'pass'], 'notes-05': ['fail_contract', 'pass', 'pass'], 'notes-06': ['unknown', 'unknown', 'unknown'],
+    'notes-07': ['fail_product', 'fail_product', 'fail_product'], 'notes-08': ['pass', 'pass', 'pass'] };
+  d.scen.forEach(s => s.r = r[s.id]);
+  d.timeline = d.timeline.map(b => b.e === null ? { ...b, e: 158, st: 'ok' } : b).concat([
+    { lane: 'F-1', s: 150, e: 158, st: 'ok' }, { lane: 'R-2', s: 160, e: 169, st: 'ok' },
+    { lane: 'merge', s: 169, e: 170, st: 'ok' }, { lane: 'wave-test', s: 170, e: 172, st: 'ok' },
+    { lane: 'review', s: 172, e: 181, st: 'ok' }, { lane: 'verify', s: 181, e: 199, st: 'fail' }, { lane: 'ledger', s: 199, e: 200, st: 'ok' },
+    { lane: 'F-4', s: 200, e: 222, st: 'fail' }, { lane: 'F-4', s: 222, e: 244, st: 'fail' }, { lane: 'F-4', s: 244, e: 266, st: 'fail' },
+    { lane: 'F-5', s: 200, e: 203, st: 'esc' },
+    { lane: 'review', s: 266, e: 278, st: 'ok' }, { lane: 'verify', s: 278, e: 302, st: 'fail' }, { lane: 'ledger', s: 302, e: 303, st: 'ok' },
+    { lane: 'report', s: 303, e: 312, st: 'ok' },
+  ]);
+  d.rounds = [{ n: 1, s: 25, e: 141 }, { n: 2, s: 141, e: 200 }, { n: 3, s: 200, e: 303 }];
+  d.events.push(
+    [199, 'verdict', 'verify R2: 6 pass, 1 fail_product (notes-07), 1 unknown (notes-06)'],
+    [203, 'escalation', 'F-5 blocked: dipende da T-6'],
+    [266, 'ticket.status', 'F-4 failed (max_visits 3)'],
+    [302, 'verdict', 'verify R3: stessi fallimenti di R2'],
+    [303, 'stop', 'stall_rounds 2/2 -> stop, nessun merge su main, branch df/notes-sharing lasciato'],
+    [312, 'node.end', 'report scritto: runs/2026-10-17-a/report.md'],
+  );
+  d.decisions.push({ by: 'F-4', text: 'Tentato LIKE come fallback a FTS5: scartato, troppo lento sul seed', uncovered: true });
+  d.merges.push({ sha: '3a9d0f7', t: 'F-1', wave: '2.1', ok: true }, { sha: 'b18e44c', t: 'F-2', wave: '2.1', ok: true },
+    { sha: '5c2e9b1', t: 'F-3', wave: '2.1', ok: true }, { sha: 'e7a01d2', t: 'R-1', wave: '2.1', ok: true }, { sha: '0f4c7a8', t: 'R-2', wave: '2.2', ok: true });
+  d.stops.push({ level: 'run', kind: 'stall_rounds', text: 'notes-06, notes-07 rossi in R2 e R3' },
+    { level: 'ticket', kind: 'max_visits', text: 'T-7, F-4' }, { level: 'ticket', kind: 'escalation', text: 'T-6, F-5' });
+  return d;
+}
+
+/* stream finto per i nodi in corso */
+const STREAM_POOL = [
+  'assistant: leggo ticket, spec e contract.md',
+  'tool Read contract.md',
+  'tool Read src/share/handler.ts',
+  'tool Grep "expiresAt" src/',
+  'assistant: nel handler GET /s/:token manca il controllo di scadenza',
+  'tool Edit src/share/handler.ts (+6 -1)',
+  'tool Bash npm test -- share',
+  'tool_result: 14 passed, 1 failed (share.expired.test.ts)',
+  'assistant: il test si aspetta 410 Gone, aggiorno la risposta',
+  'tool Edit src/share/handler.ts (+3 -2)',
+  'tool Bash npm test -- share',
+  'tool_result: 15 passed',
+  'assistant: aggiungo la decisione sul codice 410 in decisions[]',
+];
+
+function streamFor(id, extra) {
+  const base = STREAM_POOL.slice(0, 5).map((l, i) => `[${clock(141 + i)}] ${l}`);
+  return base.concat(extra[id] || []);
+}
+
+/* ------------------------------------------------------------------ pezzi condivisi */
+
+const Dot = ({ st }) => html`<span class="dot" style=${{ background: COLORS[st] || 'var(--pending)' }}></span>`;
+const Pill = ({ st, label }) => html`<span class="pill" style=${{ background: COLORS[st] || 'var(--pending)', color: '#0b0d10' }}>${label || st}</span>`;
+const Bar = ({ v, max, color }) => html`<span class="bar"><i style=${{ width: Math.min(100, v / max * 100) + '%', background: color || 'var(--running)' }}></i></span>`;
+
+function Actions({ ctx }) {
+  const { data, act } = ctx;
+  const live = data.run.status === 'running' || data.run.status === 'paused';
+  if (!live) return html`<span class="muted">run terminato - sola lettura</span>`;
+  return html`<span style=${{ display: 'flex', gap: '4px' }}>
+    ${data.run.status === 'paused'
+      ? html`<button onClick=${() => act('resume')}>Resume</button>`
+      : html`<button onClick=${() => act('pause')} title="al confine di nodo">Pausa</button>`}
+    <button onClick=${() => act('abort')} style=${{ color: 'var(--fail)' }}>Abort</button>
+  </span>`;
+}
+
+function Header({ ctx }) {
+  const r = ctx.data.run;
+  return html`<div class="panel" style=${{ flexDirection: 'row', alignItems: 'center', gap: '18px', padding: '8px 12px', flexWrap: 'wrap' }}>
+    <span><b class="mono">${r.spec}</b> <span class="muted mono">run ${r.id}</span></span>
+    <${Pill} st=${{ running: 'running', paused: 'pending', stopped: 'esc', aborted: 'fail', done: 'ok' }[r.status]} label=${r.status} />
+    <span class="mono">ROUND ${r.round}/${r.maxRounds} - wave ${r.wave}</span>
+    <span class="mono">${usd(r.cost)} / ${r.budget} <${Bar} v=${r.cost} max=${r.budget} /></span>
+    <span class="mono">${dur(r.elapsed)} / ${dur(r.wall)} <${Bar} v=${r.elapsed} max=${r.wall} /></span>
+    <span class="mono">stall ${r.stall}/${r.stallMax} <${Bar} v=${r.stall} max=${r.stallMax} color=${r.stall ? 'var(--esc)' : ''} /></span>
+    <span style=${{ marginLeft: 'auto' }}><${Actions} ctx=${ctx} /></span>
+    ${r.stopReason && html`<div style=${{ width: '100%', color: 'var(--esc)' }} class="mono">STOP: ${r.stopReason}</div>`}
+  </div>`;
+}
+
+/* grafo fisso, SVG disegnato a mano */
+function Graph({ ctx, compact }) {
+  const { data, sel, select } = ctx;
+  const st = id => data.pipe.find(p => p.id === id)?.status || data.roundNodes[id] || 'pending';
+  const Box = ({ id, x, y, w = 80, label }) => html`<g class="clickable" onClick=${() => select({ kind: 'node', id })}>
+    <rect x=${x} y=${y} width=${w} height="26" rx="4" fill="#1d212a" stroke=${COLORS[st(id)]} stroke-width=${sel?.id === id ? 2.5 : 1.3} />
+    <circle cx=${x + 9} cy=${y + 13} r="3.5" fill=${COLORS[st(id)]} />
+    <text x=${x + 17} y=${y + 17} fill="#d6dae3" font-size="10.5" font-family="ui-monospace,Menlo">${label || id}</text>
+  </g>`;
+  const L = (x1, y1, x2, y2) => html`<line x1=${x1} y1=${y1} x2=${x2} y2=${y2} stroke="#3a4150" stroke-width="1.2" marker-end="url(#arr)" />`;
+  return html`<svg viewBox="0 0 540 250" style=${{ width: '100%', height: compact ? '170px' : '100%' }}>
+    <defs><marker id="arr" viewBox="0 0 6 6" refX="5" refY="3" markerWidth="6" markerHeight="6" orient="auto"><path d="M0,0 L6,3 L0,6 z" fill="#3a4150" /></marker></defs>
+    <${Box} id="spec-gate" x=${10} y=${10} w=${84} />
+    ${L(94, 23, 112, 23)}<${Box} id="holdout-gen" x=${114} y=${10} w=${92} />
+    ${L(206, 23, 224, 23)}<${Box} id="tickets" x=${226} y=${10} />
+    ${L(266, 36, 266, 66)}
+    <rect x="10" y="68" width="520" height="110" rx="6" fill="none" stroke="#2f3542" stroke-dasharray="4 3" />
+    <text x="18" y="82" fill="#7d8596" font-size="10" font-family="ui-monospace,Menlo">round ${data.run.round}/${data.run.maxRounds}</text>
+    <rect x="18" y="88" width="300" height="78" rx="5" fill="none" stroke="#2f3542" />
+    <text x="26" y="101" fill="#7d8596" font-size="10" font-family="ui-monospace,Menlo">wave ${data.run.wave}  (ripete finche' coda vuota)</text>
+    <${Box} id="clone" x=${24} y=${120} w=${50} />${L(74, 133, 80, 133)}
+    <${Box} id="implement" x=${82} y=${120} w=${72} label="implement" />${L(154, 133, 160, 133)}
+    <${Box} id="test" x=${162} y=${120} w=${40} />${L(202, 133, 206, 133)}
+    <${Box} id="merge" x=${208} y=${120} w=${46} />${L(254, 133, 256, 133)}
+    <${Box} id="wave-test" x=${258} y=${120} w=${56} label="w-test" />
+    ${L(318, 133, 326, 133)}<${Box} id="review" x=${328} y=${120} w=${56} />
+    ${L(384, 133, 390, 133)}<${Box} id="verify" x=${392} y=${120} w=${56} />
+    ${L(448, 133, 452, 133)}<${Box} id="ledger" x=${454} y=${120} w=${56} label="ledger" />
+    <${Box} id="route" x=${452} y=${84} w=${70} label="route" />
+    ${L(477, 120, 477, 110)}
+    ${L(487, 178, 487, 196)}
+    <${Box} id="regression" x=${400} y=${198} w=${100} />
+    ${L(400, 211, 312, 211)}<${Box} id="merge-main" x=${222} y=${198} w=${88} />
+    ${L(222, 211, 134, 211)}<${Box} id="report" x=${54} y=${198} />
+  </svg>`;
+}
+
+function TicketCard({ t, ctx }) {
+  const isSel = ctx.sel?.kind === 'ticket' && ctx.sel.id === t.id;
+  return html`<div class=${'clickable ' + (isSel ? 'sel' : '')} onClick=${() => ctx.select({ kind: 'ticket', id: t.id })}
+    style=${{ border: '1px solid var(--border)', borderLeft: `3px solid ${COLORS[t.status]}`, borderRadius: '4px', padding: '4px 6px', marginBottom: '5px', background: 'var(--panel2)' }}>
+    <div class="mono" style=${{ display: 'flex', justifyContent: 'space-between' }}><b>${t.id}</b><span class="muted">v${t.visit} ${usd(t.cost)}</span></div>
+    <div style=${{ fontSize: '12px' }}>${t.title}</div>
+    ${t.deps.length > 0 && html`<div class="muted mono" style=${{ fontSize: '11px' }}>dipende da ${t.deps.join(', ')}</div>`}
+    ${t.note && html`<div style=${{ fontSize: '11px', color: COLORS[t.status] }}>${t.note}</div>`}
+  </div>`;
+}
+
+function VerifyMatrix({ ctx, dense }) {
+  const { data, select, sel } = ctx;
+  const nR = Math.max(...data.scen.map(s => s.r.length));
+  return html`<table class="mono" style=${{ fontSize: dense ? '11px' : '12px' }}>
+    <thead><tr><th>AC</th><th>scenario</th>${!dense && html`<th></th>`}${Array.from({ length: nR }, (_, i) => html`<th>R${i + 1}</th>`)}</tr></thead>
+    <tbody>${data.scen.map(s => html`<tr class=${'clickable ' + (sel?.id === s.id ? 'sel' : '')} onClick=${() => select({ kind: 'scenario', id: s.id })}>
+      <td>${s.ac.join(' ')}</td><td>${s.id}${s.replay ? '' : html` <span class="muted" title="senza replay, guidato dall'agent">*</span>`}</td>
+      ${!dense && html`<td class="muted" style=${{ fontFamily: 'inherit' }}>${s.title}</td>`}
+      ${Array.from({ length: nR }, (_, i) => html`<td>${s.r[i]
+        ? html`${s.gap?.includes(i + 1) && html`<${Pill} st="harness_gap" label="h-gap" />>`}<${Pill} st=${s.r[i]} label=${VERDICT_SHORT[s.r[i]]} />`
+        : html`<span class="muted">-</span>`}</td>`)}
+    </tr>`)}</tbody>
+  </table>
+  <div class="muted" style=${{ fontSize: '11px', marginTop: '4px' }}>* scenario senza replay, guidato dall'agent verify${data.run.status === 'running' ? ` - verify R${data.run.round} parte a coda vuota` : ''}</div>`;
+}
+
+function SideTabs({ ctx }) {
+  const [tab, setTab] = useState('decisioni');
+  const { data } = ctx;
+  return html`<div class="panel" style=${{ height: '100%' }}>
+    <div class="tabs">${['decisioni', 'stop/escalation', 'merge', 'eventi'].map(t => html`<button class=${tab === t ? 'on' : ''} onClick=${() => setTab(t)}>${t}</button>`)}</div>
+    <div class="body">
+      ${tab === 'decisioni' && html`<table>${data.decisions.map(d => html`<tr><td class="mono">${d.by}</td><td>${d.text} ${d.uncovered && html`<${Pill} st="esc" label="uncovered" />`}</td></tr>`)}</table>`}
+      ${tab === 'stop/escalation' && html`<table>
+        ${data.tickets.filter(t => t.status === 'escalated' || t.status === 'failed').map(t => html`<tr class="clickable" onClick=${() => ctx.select({ kind: 'ticket', id: t.id })}><td><${Pill} st=${t.status} /></td><td class="mono">${t.id}</td><td>${t.note}</td></tr>`)}
+        ${data.stops.map(s => html`<tr><td><${Pill} st="budget" label=${s.level} /></td><td class="mono">${s.kind}</td><td>${s.text}</td></tr>`)}
+      </table>`}
+      ${tab === 'merge' && html`<table class="mono">${data.merges.map(m => html`<tr><td>${m.wave}</td><td>${m.t}</td><td style=${{ color: m.ok ? 'var(--ok)' : 'var(--fail)' }}>${m.sha || 'abort'}</td><td class="muted" style=${{ fontFamily: 'inherit' }}>${m.note || 'merge --no-ff'}</td></tr>`)}</table>`}
+      ${tab === 'eventi' && html`<${EventList} ctx=${ctx} />`}
+    </div>
+  </div>`;
+}
+
+function EventList({ ctx }) {
+  return html`<table class="mono" style=${{ fontSize: '12px' }}>${[...ctx.data.events].reverse().map(([m, k, txt]) => html`<tr>
+    <td class="muted">${clock(m)}</td><td style=${{ color: k === 'escalation' || k === 'stop' ? 'var(--esc)' : k === 'verdict' ? 'var(--running)' : 'var(--muted)' }}>${k}</td><td style=${{ fontFamily: 'inherit' }}>${txt}</td></tr>`)}</table>`;
+}
+
+/* dettaglio: contenuto dei tab per ticket / nodo / scenario */
+function Detail({ ctx, onClose }) {
+  const { data, sel, extra } = ctx;
+  const [tab, setTab] = useState(null);
+  if (!sel) return html`<div class="muted" style=${{ padding: '12px' }}>Seleziona un nodo, un ticket o uno scenario.</div>`;
+  let title, tabs;
+  if (sel.kind === 'ticket') {
+    const t = data.tickets.find(x => x.id === sel.id);
+    title = html`<b class="mono">${t.id}</b> ${t.title} <${Pill} st=${t.status} /> <span class="muted mono">v${t.visit} ${usd(t.cost)} claude/sonnet</span>`;
+    tabs = {
+      stream: html`<pre>${streamFor(t.id, extra).join('\n')}${t.status === 'implementing' ? '\n...' : ''}</pre>`,
+      prompt: html`<pre>${`# Ticket ${t.id}: ${t.title}\nAC: ${t.ac.join(', ') || '-'}\nDipende da: ${t.deps.join(', ') || '-'}\n\n## Spec\n(notes-sharing.md, 2.1 KB)\n\n## contract.md\nRun: npm start, ready GET /health, porta 3000\nDrive: /notes, /s/:token, data-testid share-link, share-revoke ...\n\n## decisions.md (run)\n- SQLite (better-sqlite3)\n- Token 32 byte base64url, scadenza 7 giorni\n${t.visit > 1 ? '\n## Visita ' + t.visit + ': coda output test rossi\nFAIL share.expired.test.ts\n  expected 410, received 200' : ''}${t.kind === 'fix' ? '\n\n## Fix ticket (template engine)\nscenario: ' + t.title.split(':')[0].replace('fix ', '') + '\nmotivo: ' + t.title.split(': ')[1] : ''}`}</pre>`,
+      response: html`<pre>${JSON.stringify({ status: t.status === 'escalated' ? 'blocked' : 'done', summary: t.note || `Implementato ${t.title}`, decisions: data.decisions.filter(d => d.by === t.id).map(d => d.text) }, null, 2)}</pre>`,
+      diff: html`<pre style=${{ color: '#a8b1c2' }}>${'src/share/handler.ts   | 14 +++++++---\nsrc/share/token.ts     |  6 ++++\ntest/share.test.ts     | 22 ++++++++++++++\n\n@@ -12,7 +12,13 @@ export async function getShared(req, res) {\n   const share = await db.shares.byToken(req.params.token)\n-  if (!share) return res.status(404).end()\n+  if (!share) return res.status(404).end()\n+  if (share.expiresAt < Date.now()) {\n+    return res.status(410).json({ error: "expired" })\n+  }\n   const note = await db.notes.get(share.noteId)'}</pre>`,
+      test: html`<pre>${t.status === 'failed' ? 'npm test  (exit 1)\n\nFAIL search.test.ts > full-text\n  Error: no such module: fts5\n\nTests: 1 failed, 41 passed' : 'npm test  (exit 0)\n\nTests: 42 passed\nTime: 8.1s'}</pre>`,
+      visite: html`<table class="mono">${Array.from({ length: Math.max(1, t.visit) }, (_, i) => html`<tr><td>v${i + 1}</td><td>${i + 1 < t.visit ? html`<${Pill} st="fail" label="test rossi" />` : html`<${Pill} st=${t.status} />`}</td><td class="muted">sha ${(0x9a3f1 + i * 7919).toString(16)}</td><td>${usd(t.cost / Math.max(1, t.visit))}</td></tr>`)}</table>`,
+    };
+  } else if (sel.kind === 'node') {
+    const p = data.pipe.find(x => x.id === sel.id);
+    const st = p?.status || data.roundNodes[sel.id];
+    const isTool = !p ? ['clone', 'test', 'merge', 'wave-test', 'ledger', 'route'].includes(sel.id) : p.type !== 'llm';
+    title = html`<b class="mono">${sel.id}</b> <${Pill} st=${st} /> <span class="muted mono">${isTool ? 'tool - zero token' : (p?.harness || 'claude/opus')} ${p?.cost ? usd(p.cost) : ''}</span>`;
+    tabs = isTool ? {
+      log: html`<pre>${sel.id === 'merge' ? data.merges.map(m => `${m.wave}  ${m.t}  ${m.sha || 'ABORT'}  ${m.note || ''}`).join('\n') : `[${clock(141)}] ${sel.id} start\n[${clock(141)}] ${sel.id} end (exit 0)`}</pre>`,
+      stato: html`<pre>${JSON.stringify({ node: sel.id, status: st, key: `notes-sharing/${sel.id}/r${data.run.round}` }, null, 2)}</pre>`,
+    } : {
+      stream: html`<pre>${`[${clock(0)}] tool Read spec/notes-sharing.md\n[${clock(1)}] tool Read contract.md\n[${clock(3)}] assistant: 7 AC, 2 senza driver UI (AC-6 email)\n[${clock(6)}] tool Write scenarios/notes-sharing/notes-01.md\n...`}</pre>`,
+      prompt: html`<pre>${`prompts/${sel.id}.md\n\nSei nel container holdout-gen. Hai solo spec e contract.md.\nScrivi scenari con AC-id, replay Playwright con locator user-facing...`}</pre>`,
+      response: html`<pre>${JSON.stringify({ scenarios: 8, replays: 6, uncovered_ac: [] }, null, 2)}</pre>`,
+      costo: html`<table class="mono"><tr><td>harness</td><td>${p?.harness}</td></tr><tr><td>oracle</td><td>${p?.oracle}</td></tr><tr><td>token in/out</td><td>412k / 38k</td></tr><tr><td>costo</td><td>${usd(p?.cost || 0)}</td></tr><tr><td>durata</td><td>14m</td></tr></table>`,
+    };
+  } else {
+    const s = data.scen.find(x => x.id === sel.id);
+    title = html`<b class="mono">${s.id}</b> ${s.title} <span class="muted mono">${s.ac.join(' ')}</span>`;
+    tabs = {
+      verdetti: html`<table class="mono">${s.r.map((v, i) => html`<tr><td>R${i + 1}</td><td><${Pill} st=${v} /></td><td style=${{ fontFamily: 'inherit' }}>${v === 'pass' ? '-' : s.reason}</td></tr>`)}</table>`,
+      evidenze: html`<div style=${{ display: 'flex', gap: '8px', flexWrap: 'wrap' }}>${[1, 2, 3].map(i => html`<div style=${{ width: '160px', height: '100px', border: '1px dashed var(--border)', display: 'flex', alignItems: 'center', justifyContent: 'center' }} class="muted mono">step${i}.png</div>`)}
+        <div class="muted mono" style=${{ width: '100%' }}>runs/${data.run.id}/evidence/${s.id}/  - trace.zip (apri in Playwright trace viewer)</div></div>`,
+      replay: s.replay ? html`<pre>${`replays/notes-sharing/${s.id}.spec.ts  (hash ok)\n\nawait page.goto('/notes')\nawait page.getByRole('button', { name: 'Condividi' }).click()\nawait expect(page.getByTestId('share-link')).toBeVisible()`}</pre>` : html`<div class="muted">Nessun replay: guidato dall'agent con la skill verify.</div>`,
+    };
+  }
+  const keys = Object.keys(tabs);
+  const cur = keys.includes(tab) ? tab : keys[0];
+  return html`<div style=${{ display: 'flex', flexDirection: 'column', height: '100%', minHeight: 0 }}>
+    <div style=${{ padding: '6px 10px', display: 'flex', gap: '8px', alignItems: 'center', borderBottom: '1px solid var(--border)' }}>
+      <span style=${{ flex: 1 }}>${title}</span>${onClose && html`<button onClick=${onClose}>x</button>`}
+    </div>
+    <div class="tabs">${keys.map(k => html`<button class=${k === cur ? 'on' : ''} onClick=${() => setTab(k)}>${k}</button>`)}</div>
+    <div style=${{ padding: '8px 10px', overflow: 'auto', flex: 1, minHeight: 0 }}>${tabs[cur]}</div>
+  </div>`;
+}
+
+/* ------------------------------------------------------------------ Variante A: dashboard a griglia (layout del design doc) */
+
+function VariantA({ ctx }) {
+  const cols = ['queued', 'implementing', 'tested', 'merged'];
+  const { data } = ctx;
+  const round = data.run.round;
+  const cur = data.tickets.filter(t => t.round === round || t.status === 'queued');
+  const prev = data.tickets.filter(t => !cur.includes(t));
+  const bad = t => t.status === 'failed' || t.status === 'escalated';
+  return html`<div style=${{ display: 'grid', gridTemplateRows: 'auto minmax(0,1.1fr) minmax(0,1fr)' + (ctx.sel ? ' 300px' : ''), gap: '8px', padding: '8px', height: '100vh', paddingBottom: ctx.sel ? '8px' : '60px' }}>
+    <${Header} ctx=${ctx} />
+    <div style=${{ display: 'grid', gridTemplateColumns: 'minmax(0,1fr) minmax(0,1.2fr)', gap: '8px', minHeight: 0 }}>
+      <div class="panel"><h3>grafo</h3><div class="body"><${Graph} ctx=${ctx} /></div></div>
+      <div class="panel"><h3>ticket - round ${round} <span class="muted" style=${{ textTransform: 'none' }}>(round precedenti: ${prev.filter(t => t.status === 'merged').length} merged)</span></h3>
+        <div class="body" style=${{ display: 'grid', gridTemplateColumns: 'repeat(5, minmax(0,1fr))', gap: '6px' }}>
+          ${cols.map(c => html`<div><div class="muted mono" style=${{ fontSize: '11px', marginBottom: '4px' }}><${Dot} st=${c} />${c}</div>${cur.filter(t => t.status === c).map(t => html`<${TicketCard} t=${t} ctx=${ctx} />`)}</div>`)}
+          <div><div class="muted mono" style=${{ fontSize: '11px', marginBottom: '4px' }}><${Dot} st="fail" />failed / escalated</div>${data.tickets.filter(bad).map(t => html`<${TicketCard} t=${t} ctx=${ctx} />`)}</div>
+        </div></div>
+    </div>
+    <div style=${{ display: 'grid', gridTemplateColumns: 'minmax(0,1.3fr) minmax(0,1fr)', gap: '8px', minHeight: 0 }}>
+      <div class="panel"><h3>verify - AC x scenario x round</h3><div class="body"><${VerifyMatrix} ctx=${ctx} /></div></div>
+      <${SideTabs} ctx=${ctx} />
+    </div>
+    ${ctx.sel && html`<div class="panel"><${Detail} ctx=${ctx} onClose=${() => ctx.select(null)} /></div>`}
+  </div>`;
+}
+
+/* ------------------------------------------------------------------ Variante B: timeline / gantt */
+
+function VariantB({ ctx }) {
+  const { data, sel, select } = ctx;
+  const engineLanes = ['holdout-gen', 'tickets', 'merge', 'wave-test', 'review', 'verify', 'ledger', 'report'].filter(l => data.timeline.some(b => b.lane === l));
+  const ticketLanes = data.tickets.map(t => t.id).filter(id => data.timeline.some(b => b.lane === id));
+  const end = Math.max(data.run.elapsed, 60);
+  const W = 1000, LANE = 22, LBL = 150;
+  const x = m => LBL + (m / end) * (W - LBL - 10);
+  const lanes = [...engineLanes, '__sep', ...ticketLanes];
+  const H = lanes.length * LANE + 30;
+  const ticks = []; for (let m = 0; m <= end; m += 30) ticks.push(m);
+  const kindOf = id => data.tickets.some(t => t.id === id) ? 'ticket' : 'node';
+  return html`<div style=${{ display: 'grid', gridTemplateRows: 'auto minmax(0,1fr) auto', gap: '8px', padding: '8px', height: '100vh', paddingBottom: '60px' }}>
+    <${Header} ctx=${ctx} />
+    <div style=${{ display: 'grid', gridTemplateColumns: 'minmax(0,1.7fr) minmax(360px,1fr)', gap: '8px', minHeight: 0 }}>
+      <div class="panel"><h3>timeline del run <span class="muted" style=${{ textTransform: 'none' }}>- barre = visite, colore = esito, click = dettaglio</span></h3>
+        <div class="body">
+          <svg viewBox=${`0 0 ${W} ${H}`} style=${{ width: '100%' }}>
+            ${data.rounds.map((r, i) => html`<rect x=${x(r.s)} y="0" width=${x(r.e ?? end) - x(r.s)} height=${H} fill=${i % 2 ? '#161a22' : '#1a1f29'} />
+              <text x=${x(r.s) + 4} y="12" fill="#7d8596" font-size="10" font-family="ui-monospace,Menlo">round ${r.n}</text>`)}
+            ${ticks.map(m => html`<line x1=${x(m)} x2=${x(m)} y1="16" y2=${H} stroke="#262b36" /><text x=${x(m) + 2} y=${H - 2} fill="#5b6373" font-size="9" font-family="ui-monospace,Menlo">${clock(m)}</text>`)}
+            ${lanes.map((l, i) => {
+              const y = 18 + i * LANE;
+              if (l === '__sep') return html`<line x1="0" x2=${W} y1=${y + LANE / 2} y2=${y + LANE / 2} stroke="#3a4150" stroke-dasharray="3 3" />`;
+              const t = data.tickets.find(tt => tt.id === l);
+              const isSel = sel?.id === l;
+              return html`<g class="clickable" onClick=${() => select({ kind: kindOf(l), id: l })}>
+                <rect x="0" y=${y} width=${W} height=${LANE - 2} fill=${isSel ? '#1b2433' : 'transparent'} />
+                <text x="6" y=${y + 14} fill=${t ? COLORS[t.status] : '#d6dae3'} font-size="11" font-family="ui-monospace,Menlo">${l}${t ? ' ' + t.title.slice(0, 16) : ''}</text>
+                ${data.timeline.filter(b => b.lane === l).map(b => {
+                  const e = b.e ?? data.run.elapsed;
+                  return html`<rect x=${x(b.s)} y=${y + 3} width=${Math.max(2, x(e) - x(b.s) - 1)} height=${LANE - 8} rx="2" fill=${COLORS[b.st]} opacity=${b.st === 'running' ? 0.9 : 0.75}>
+                    <title>${l} ${b.label || ''} ${clock(b.s)}-${clock(e)} ${b.st}</title></rect>`;
+                })}
+              </g>`;
+            })}
+            ${data.run.status === 'running' && html`<line x1=${x(data.run.elapsed)} x2=${x(data.run.elapsed)} y1="0" y2=${H} stroke="var(--running)" stroke-width="1.5" />`}
+          </svg>
+          <div class="muted" style=${{ fontSize: '11px' }}>sopra la linea tratteggiata: nodi engine; sotto: ticket. Costo cumulato ${usd(data.run.cost)}.</div>
+        </div></div>
+      <div class="panel"><${Detail} ctx=${ctx} /></div>
+    </div>
+    <div class="panel"><h3>holdout</h3><div class="body" style=${{ display: 'flex', gap: '6px', flexWrap: 'wrap' }}>
+      ${data.scen.map(s => html`<span class=${'clickable mono ' + (sel?.id === s.id ? 'sel' : '')} onClick=${() => select({ kind: 'scenario', id: s.id })}
+        style=${{ border: '1px solid var(--border)', borderRadius: '4px', padding: '3px 6px', display: 'flex', gap: '3px', alignItems: 'center' }}>
+        ${s.id} ${s.r.map(v => html`<span title=${v} style=${{ width: '10px', height: '10px', borderRadius: '2px', background: COLORS[v], display: 'inline-block' }}></span>`)}
+      </span>`)}
+    </div></div>
+  </div>`;
+}
+
+/* ------------------------------------------------------------------ Variante C: inbox "cosa richiede attenzione" */
+
+function VariantC({ ctx }) {
+  const { data, sel, select } = ctx;
+  const r = data.run;
+  const last = s => s.r[s.r.length - 1];
+  const groups = [
+    { name: 'Richiede te', st: 'esc', items: data.tickets.filter(t => t.status === 'escalated').map(t => ({ kind: 'ticket', id: t.id, txt: t.note, sub: t.title })) },
+    { name: 'Scenari non verdi', st: 'fail', items: data.scen.filter(s => last(s) !== 'pass').map(s => ({ kind: 'scenario', id: s.id, txt: `${last(s)}: ${s.reason}`, sub: s.title, streak: s.r.filter(v => v === last(s)).length })) },
+    { name: 'Ticket falliti', st: 'fail', items: data.tickets.filter(t => t.status === 'failed').map(t => ({ kind: 'ticket', id: t.id, txt: t.note, sub: t.title })) },
+    { name: 'In corso', st: 'running', items: data.tickets.filter(t => ['implementing', 'tested', 'queued'].includes(t.status)).map(t => ({ kind: 'ticket', id: t.id, txt: `${t.status} v${t.visit}`, sub: t.title })) },
+    { name: 'Decisioni uncovered', st: 'esc', items: data.decisions.filter(d => d.uncovered).map(d => ({ kind: 'ticket', id: d.by, txt: d.text, sub: 'decisione' })) },
+    { name: 'Fatto', st: 'ok', collapsed: true, items: data.tickets.filter(t => t.status === 'merged').map(t => ({ kind: 'ticket', id: t.id, txt: `merged v${t.visit} ${usd(t.cost)}`, sub: t.title })) },
+  ];
+  const [open, setOpen] = useState({ Fatto: false });
+  const green = data.scen.filter(s => last(s) === 'pass').length;
+  const headline = r.status === 'running' || r.status === 'paused'
+    ? `In corso: round ${r.round}/${r.maxRounds}, ${data.tickets.filter(t => t.status === 'implementing').length} agent al lavoro`
+    : r.status === 'aborted' ? 'Abortito manualmente, nessun merge' : 'Fermato senza merge su main';
+  const steps = ['spec-gate', 'holdout-gen', 'tickets', ...Array.from({ length: r.maxRounds }, (_, i) => 'R' + (i + 1)), 'regression', 'merge-main', 'report'];
+  const stepSt = s => {
+    if (s.startsWith('R') && s.length <= 2) { const n = +s.slice(1); return n < r.round ? 'ok' : n === r.round ? (r.status === 'running' ? 'running' : 'esc') : 'pending'; }
+    return data.pipe.find(p => p.id === s)?.status;
+  };
+  return html`<div style=${{ display: 'grid', gridTemplateRows: 'auto auto minmax(0,1fr)', gap: '10px', padding: '14px 18px', height: '100vh', paddingBottom: '60px', maxWidth: '1400px', margin: '0 auto' }}>
+    <div style=${{ display: 'flex', alignItems: 'flex-end', gap: '24px', flexWrap: 'wrap' }}>
+      <div style=${{ flex: 1 }}>
+        <div class="muted mono">${r.project} / ${r.spec} - run ${r.id} - ${r.branch}</div>
+        <div style=${{ fontSize: '24px', fontWeight: 600, color: r.status === 'running' ? 'var(--text)' : 'var(--esc)' }}>${headline}</div>
+        ${r.stopReason && html`<div class="mono" style=${{ color: 'var(--esc)' }}>${r.stopReason}</div>`}
+      </div>
+      ${[['holdout verdi', `${green}/${data.scen.length}`], ['costo', `${usd(r.cost)} / ${r.budget}`], ['durata', `${dur(r.elapsed)} / ${dur(r.wall)}`], ['$ / scenario verde', usd(r.cost / Math.max(1, green))]].map(([k, v]) => html`
+        <div style=${{ textAlign: 'right' }}><div class="muted" style=${{ fontSize: '11px' }}>${k}</div><div class="mono" style=${{ fontSize: '18px' }}>${v}</div></div>`)}
+      <${Actions} ctx=${ctx} />
+    </div>
+    <div style=${{ display: 'flex', gap: '2px' }}>${steps.map(s => html`<div class="clickable" onClick=${() => !s.match(/^R\d$/) && select({ kind: 'node', id: s })} title=${s}
+      style=${{ flex: s.match(/^R\d$/) ? 1 : 1.4, padding: '4px 6px', background: 'var(--panel)', borderTop: `3px solid ${COLORS[stepSt(s)] || 'var(--pending)'}`, fontSize: '11px' }} class="mono">${s}</div>`)}</div>
+    <div style=${{ display: 'grid', gridTemplateColumns: 'minmax(320px,0.9fr) minmax(0,1.6fr)', gap: '10px', minHeight: 0 }}>
+      <div class="panel"><div class="body" style=${{ padding: 0 }}>
+        ${groups.filter(g => g.items.length).map(g => html`<div>
+          <div class="clickable" onClick=${() => setOpen({ ...open, [g.name]: !(open[g.name] ?? !g.collapsed) })}
+            style=${{ padding: '8px 10px', fontSize: '11px', textTransform: 'uppercase', letterSpacing: '.06em', color: COLORS[g.st], borderBottom: '1px solid var(--border)', background: 'var(--panel2)' }}>
+            ${g.name} (${g.items.length})</div>
+          ${(open[g.name] ?? !g.collapsed) && g.items.map(it => html`<div class=${'clickable ' + (sel?.id === it.id ? 'sel' : '')} onClick=${() => select({ kind: it.kind, id: it.id })}
+            style=${{ padding: '6px 10px', borderBottom: '1px solid var(--border)' }}>
+            <div><b class="mono">${it.id}</b> <span class="muted">${it.sub}</span>${it.streak > 1 ? html` <span class="pill" style=${{ background: 'var(--esc)', color: '#000' }}>${it.streak} round</span>` : ''}</div>
+            <div style=${{ fontSize: '12px' }}>${it.txt}</div>
+          </div>`)}
+        </div>`)}
+      </div></div>
+      <div class="panel">${sel ? html`<${Detail} ctx=${ctx} />` : html`<div class="body"><h4 style=${{ margin: '0 0 6px' }}>Ultimi eventi</h4><${EventList} ctx=${ctx} /></div>`}</div>
+    </div>
+  </div>`;
+}
+
+/* ------------------------------------------------------------------ app + switcher */
+
+const VARIANTS = [['A', 'Dashboard a griglia', VariantA], ['B', 'Timeline / gantt', VariantB], ['C', 'Inbox attenzione', VariantC]];
+const qp = new URLSearchParams(location.search);
+
+function App() {
+  const [variant, setVariant] = useState(qp.get('variant') || 'A');
+  const [mode, setMode] = useState(qp.get('mode') || 'live');
+  const [sel, select] = useState(null);
+  const [ctrl, setCtrl] = useState(null); // pause | abort
+  const [tick, setTick] = useState(0);
+  const [extra, setExtra] = useState({});
+  const [showState, setShowState] = useState(false);
+
+  useEffect(() => {
+    const p = new URLSearchParams(location.search); p.set('variant', variant); p.set('mode', mode);
+    history.replaceState(null, '', '?' + p);
+  }, [variant, mode]);
+
+  // simulazione live: avanza tempo, costo e stream degli agent in corso
+  useEffect(() => {
+    if (mode !== 'live' || ctrl) return;
+    const h = setInterval(() => {
+      setTick(t => t + 1);
+      setExtra(ex => {
+        const n = { ...ex };
+        ['F-1', 'F-3', 'R-1'].forEach(id => {
+          const arr = n[id] || [];
+          if (arr.length < STREAM_POOL.length - 5) n[id] = [...arr, `[${clock(146 + arr.length)}] ${STREAM_POOL[5 + arr.length]}`];
+        });
+        return n;
+      });
+    }, 1500);
+    return () => clearInterval(h);
+  }, [mode, ctrl]);
+
+  useEffect(() => {
+    const k = e => {
+      if (e.target.closest('input,textarea,[contenteditable]')) return;
+      const i = VARIANTS.findIndex(v => v[0] === variant);
+      if (e.key === 'ArrowRight') setVariant(VARIANTS[(i + 1) % VARIANTS.length][0]);
+      if (e.key === 'ArrowLeft') setVariant(VARIANTS[(i - 1 + VARIANTS.length) % VARIANTS.length][0]);
+      if (e.key === 'Escape') select(null);
+    };
+    addEventListener('keydown', k); return () => removeEventListener('keydown', k);
+  }, [variant]);
+
+  const data = mode === 'done' ? doneData() : baseData();
+  if (mode === 'live') {
+    data.run.elapsed += tick * 0.05; data.run.cost += tick * 0.004;
+    if (ctrl === 'pause') data.run.status = 'paused';
+    if (ctrl === 'abort') { data.run.status = 'aborted'; data.run.stopReason = 'abort manuale: container fermati, nessun merge'; }
+    if (ctrl) data.events.push([data.run.elapsed, 'control.ack', ctrl === 'pause' ? 'pausa: attendo fine nodi in corso (F-1, F-3, R-1)' : ctrl]);
+  }
+  const act = a => setCtrl(a === 'resume' ? null : a);
+  const ctx = { data, sel, select, act, extra };
+  const [key, name, V] = VARIANTS.find(v => v[0] === variant) || VARIANTS[0];
+  const cyc = d => { const i = VARIANTS.findIndex(v => v[0] === key); setVariant(VARIANTS[(i + d + VARIANTS.length) % VARIANTS.length][0]); };
+
+  return html`
+    <${V} ctx=${ctx} />
+    ${showState && html`<div id="statebox"><pre>${JSON.stringify({ variant: key, mode, sel, ctrl, run: data.run }, null, 2)}</pre></div>`}
+    <div id="switcher">
+      <button onClick=${() => cyc(-1)}>${'<'}</button>
+      <span class="lbl">${key} (${name})</span>
+      <button onClick=${() => cyc(1)}>${'>'}</button>
+      <span>|</span>
+      <button class=${mode === 'live' ? 'on' : ''} onClick=${() => { setMode('live'); setCtrl(null); }}>live</button>
+      <button class=${mode === 'done' ? 'on' : ''} onClick=${() => setMode('done')}>mattino</button>
+      <button class=${showState ? 'on' : ''} onClick=${() => setShowState(!showState)}>stato</button>
+    </div>`;
+}
+
+render(html`<${App} />`, document.getElementById('app'));
+</script>
+</body>
+</html>
