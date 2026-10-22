@@ -1,0 +1,5 @@
+# yaml-language-server: $schema=https://nexus.sourcesense.com/repository/public_raw/souk/souk.schema.json
+version: 1
+
+registries:
+  default: ssh://git@bitbucket.sourcesense.com:7999/lib/souk-registry.git

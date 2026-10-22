@@ -173,7 +173,7 @@ For web apps replays use user-facing Playwright locators (`getByRole`, `getByLab
 
 ### Gate: `heideng accept <spec>`
 
-The gate is the only step of a spec where a person takes part. The node uses the same mechanism as the other llm nodes (see [Questions and answerers](#questions-and-answerers)): on `needs_input` heideng shows proposals and questions in the terminal, collects the person's answers and resumes the session with `--resume`.
+The gate is the only step of a spec where a person takes part. The node uses the same mechanism as the other llm nodes (see [Questions and answerers](#questions-and-answerers)): on `needs_input` heideng shows proposals and questions in a TUI (see [`accept`](#accept)), collects the person's answers and resumes the session with `--resume`.
 
 1. Checks the spec with the Run / Drive / Observe checklist: verifiable behaviors, contract delta for each section.
 2. For each gap it proposes an addition; the person confirms or corrects.
@@ -215,6 +215,7 @@ holdout-gen generates the holdout from spec, contract and `acceptance.md`, in a 
   - parsing: replay typecheck, `playwright test --list`;
   - skill: frontmatter and sections present.
 - Holdout oracle: AC coverage and non-trivial assertions. This check catches empty or trivial scenarios.
+- A tool check that cannot run (the tool exits with a usage or configuration error before reading the holdout, missing image or binary) is an engine `error`, exit code 4, with the tool output in the message. It never returns as `issues` to holdout-gen and never counts toward `oracle_rounds`, because no change to spec, contract or holdout fixes it.
 
 ### Immutability
 
@@ -401,7 +402,9 @@ Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions
 
 - The output schema of every `llm` node has the `needs_input` status with `questions[]`. heideng's system prompt requires that when a skill asks the user, the node stops with `needs_input` and includes the proposal it asks confirmation for.
 - On `needs_input` the engine runs the node's answerer (the person in the gate, the ticket oracle in the tickets node, the responder elsewhere), then resumes the session with `--resume <session_id>` and the answers in the prompt.
-- After a crash the session no longer exists, so the node restarts from scratch with the answers already given in the prompt.
+- Containers are removed at the end of each attempt, so sessions live outside them: every node execution has its own Claude Code config dir `nodes/<exec>/claude/`, created before the first attempt and mounted read-write in each container of that execution as `CLAUDE_CONFIG_DIR`. A tickets pass that resumes the previous pass's session (graph-check errors) mounts the dir of the first pass.
+- Every question and answer of an execution is saved in `nodes/<exec>/qa.json` as soon as it is given. A rerun of the same execution (resume, `accept` after an error) starts from the saved answers and asks only the open questions.
+- When the session is gone (crash, `No conversation found with session ID` on `--resume`), the next attempt restarts from scratch with the node's full prompt plus every answer already given to that node, previous passes included. The failed resume counts as one attempt; the from-scratch restart happens at most once per execution.
 - Every question with its answer goes to `decisions.md` and to the `question` event. `uncovered` answers end up in "To do for you" in the report.
 
 ### Responder
@@ -538,6 +541,8 @@ The engine has a TypeScript schema for each version. The server converts old run
 - The mounts of each node are in the "Sees" column of [llm nodes](#llm-nodes).
 - The app under test runs in a dedicated container on an internal network, reachable by verify.
 - Credentials reach containers through env or a copy in tmpfs.
+- Every container runs as the host user (`--user <uid>:<gid>`, with podman `--userns keep-id`) and with `--cap-drop ALL`, so files written on the mounts belong to the person. `HOME` points to a writable path, because that uid has no home in the image. Volumes the containers write to (dependency cache) are writable by that user from their first use.
+- Image builds run as root inside the build and use none of these options.
 
 ### Images
 
@@ -547,6 +552,10 @@ The engine has a TypeScript schema for each version. The server converts old run
 | `heideng-verify` | `heideng-base` + Playwright with browsers + playwright-cli with its skill + `heideng-exec` | holdout-gen, verify | heideng |
 | `heideng-<project>:<hash>` | `FROM heideng-base` + project stack | implement, test, review, app under test | engine, from `.heideng/Dockerfile` |
 
+- `heideng-base` and `heideng-verify` are tagged with the hash of their build definition. A heideng change that alters the definition produces a new tag and a rebuild, with no manual removal of old images.
+- Every tool installed in the heideng images has a version pinned by heideng (Claude Code, TypeScript, Playwright, playwright-cli). A major release of a tool can change its CLI (TypeScript 7 removed `baseUrl`), and an unpinned version breaks the checks of every run at once.
+- Replays import packages installed globally in `heideng-verify` (`@playwright/test`); the image makes them resolvable by standard module resolution from any directory, so typecheck and `playwright test --list` need no path options.
+- With docker the engine builds with the classic builder, because BuildKit rejects `--network` to a user network and every build goes through the egress proxy. Podman accepts it.
 - `.heideng/Dockerfile` is a repo file, and agents create and modify it like any other file.
 - `<hash>` covers `.heideng/Dockerfile` and the lockfiles. The engine rebuilds at the wave boundary when the hash changes.
 - Bootstrap: with a repo without `.heideng/Dockerfile`, `T-01` runs alone in the first wave, in `heideng-base`, and creates stack, `.heideng/*` and skeleton. After the merge the engine builds the image. If the spec fixes the stack, the bootstrap respects it; otherwise the choice is a question to the answerer and goes to `decisions.md` as `uncovered`.
@@ -557,6 +566,9 @@ The engine has a TypeScript schema for each version. The server converts old run
 - The other containers run on an `--internal` network with `HTTPS_PROXY` pointing to the proxy. A tool that ignores the proxy has no route to the internet. This works with podman and docker, macOS included.
 - Node allowlist: provider endpoints and package registries (`container.allow`).
 - Agents write the Dockerfile, so the project image build also goes through the proxy, with the allowlist extended to package mirrors (`container.build_allow`).
+- `heideng init` derives `allow` from the detected package manager: `api.anthropic.com` plus its registries (npm, pnpm, bun: `registry.npmjs.org`; yarn: also `registry.yarnpkg.com`, `repo.yarnpkg.com`; pip, uv, poetry: `pypi.org`, `files.pythonhosted.org`; go: `proxy.golang.org`, `sum.golang.org`). `build_allow` adds the OS package mirror; builds use `allow + build_allow`.
+- The builds of `heideng-base` and `heideng-verify` use an allowlist fixed in heideng (Debian and npm mirrors, Playwright's browser download hosts `cdn.playwright.dev` and `storage.googleapis.com`), independent of the project config.
+- The proxy logs every host it refuses. When a build or a node fails, the engine reads the proxy log before stopping it and names the blocked hosts in the error: `-> add <host> to container.build_allow in heideng.yaml` for project images, "report it as a heideng bug" for heideng images. Install scripts download from hosts no table can predict (browsers, prebuilt binaries), so the error is what makes the allowlist manageable.
 
 ### Credentials
 
@@ -582,7 +594,8 @@ run(prompt, { cwd, model, effort, schema, budget, resume? }) -> { output, cost, 
 - `claude -p --output-format stream-json --verbose` with `--json-schema`, `--max-budget-usd`, `--effort`, `--model`, `--allowedTools` / `--disallowedTools`, `--append-system-prompt`.
 - Structured output is the `structured_output` of the `result` message.
 - Claude Code loads skills natively. heideng invokes those with `disable-model-invocation: true` in the prompt as a command (`/to-tickets <spec>`).
-- `--resume <session_id>` resumes the session after the answerer's answers.
+- `--resume <session_id>` resumes the session after the answerer's answers. The session is found only in the execution's config dir (see [Questions and answerers](#questions-and-answerers)).
+- In containers `claude` runs with `--permission-mode bypassPermissions`. In `-p` mode nobody can approve a permission prompt, so any other mode denies writes and compound commands and the node stalls asking where it may write. The container is the boundary: mounts, network and user decide what the agent can touch.
 
 ### Prompts and skills
 
@@ -666,6 +679,11 @@ The project customizes the phases without touching heideng's prompts and skills.
   - llm node: Stream, Prompt, Response, Cost; tool node: Log, State;
   - scenario: Verdicts per round, Evidence (screenshots, Playwright traces), Replay;
   - no selection: Decisions (`decisions.md`, `uncovered` flag), Stops/escalations, Merges/bisect, Events.
+  - nodes with questions: a Questions tab from `qa.json`, one entry per turn with question, proposal, answer, source and `uncovered` flag.
+- Rendering of the detail panes, so a person reads them without parsing JSON:
+  - Stream as a conversation: a header with model, cwd and permission mode (highlighted when it is not `bypassPermissions`); assistant text as markdown; each tool call as a collapsible row with input and result, marked when it failed or was denied; thinking hidden behind a toggle; a filter for errors only; a separator per attempt.
+  - Response from the node's output schema: `status` as a colored label, `summary` first, long strings as prose, arrays of objects as cards, a toggle for the raw JSON.
+  - Prompt as markdown.
 - Holdout strip: for each scenario one square per round colored by verdict. Click: scenario detail.
 - Prototype with fake data: `prototypes/df-ui.html`, variant B (`?variant=B`), live and morning modes.
 
@@ -685,7 +703,7 @@ The project customizes the phases without touching heideng's prompts and skills.
 
 ### Stack
 
-- Server: `Bun.serve` / `node:http` inside the CLI. Endpoints: `/`, `/api/run`, `/api/events` (SSE), `/api/node/:exec/*`, `/api/runs`, `POST /api/control`.
+- Server: `Bun.serve` / `node:http` inside the CLI. Endpoints: `/`, `/api/run`, `/api/events` (SSE), `/api/node/:exec/*` (stream, prompt, response, status, `qa`), `/api/runs`, `POST /api/control`.
 - Frontend: a single HTML file with Preact + htm bundled in the package.
 
 ## Report and metrics
@@ -732,8 +750,8 @@ git diff --stat main...heideng/<slug>
 
 | Command | What it does | Main flags |
 |---|---|---|
-| `heideng init` | detects stack, package manager and commands; generates `heideng.yaml`, empty `contract.md`, `.heideng/Dockerfile` if the stack is detectable, the Heideng section of `CLAUDE.md`; flags an `AGENTS.md` not included by `CLAUDE.md` | `--force` |
-| `heideng accept <spec>` | gate: `heideng/<slug>` branch with `spec.md`, `acceptance.md`, `contract.md`, `spec.lock` | - |
+| `heideng init` | detects stack, package manager and commands; generates `heideng.yaml` (with the allowlists of the package manager, see [Egress](#egress)), empty `contract.md`, `.heideng/Dockerfile` if the stack is detectable, the Heideng section of `CLAUDE.md`; flags an `AGENTS.md` not included by `CLAUDE.md` | `--force` |
+| `heideng accept <spec>` | gate: `heideng/<slug>` branch with `spec.md`, `acceptance.md`, `contract.md`, `spec.lock` | `--plain` |
 | `heideng run <spec>` | starts the run and the UI | `--no-ui` |
 | `heideng resume [run]` | with a live engine (pid in `run.lock`) writes `resume` to `control.jsonl`; otherwise relaunches the engine on the node in progress | `--add-usd`, `--add-rounds`, `--add-time` |
 | `heideng resolve <id> "note"` | closes an escalation with a decision | - |
@@ -818,9 +836,41 @@ Inspect
 #### `accept`
 
 - During the gate's work stderr shows the live area with the gate node only.
-- On `needs_input` the CLI prints the gaps and questions numbered, each with the proposal. For each one the person presses Enter to confirm the proposal or writes the correction; then the session resumes and the live area returns.
-- Before the commit the CLI shows the summary and asks for confirmation (`y/n`): ACs with id and one line each, superseded ACs, contract delta per section (Run, Drive, Observe).
-- After the commit it prints on stdout: branch, commit sha, `spec.lock` version, paths of `spec.md`, `acceptance.md` and `contract.md`, next command `heideng run <spec>`.
+- The TUI draws on stderr and needs stdin and stderr on a TTY; stdout keeps only the result lines. `--plain` (and a stderr that is not a TTY) uses numbered line prompts on stderr: Enter confirms the proposal, a line of text corrects it, `y/n` confirms the summary. Scripted drives use `--plain`.
+- `ctrl-c` on any screen, also while `$EDITOR` is open, closes `accept` with exit code 3 and creates nothing.
+- The interactive part is a full-screen TUI on the terminal's alternate screen. It opens on every `needs_input` and on the final confirmation, and closes when the gate session resumes or the commit is done.
+
+Questions screen, on `needs_input`:
+
+```
++- heideng accept notes-sharing --------------------------- gate v2 - 3/5 -+
+| ITEMS                    | [Drive] Gap: share link expiration             |
+| [x] 1 Run: ready signal  |                                                |
+| [~] 2 Drive: expiration  | Spec: "a share link expires after 7 days"      |
+| [ ] 3 Observe: 410 body  | Drive declares no time control, so the         |
+| [ ] 4 Q: seed users      | expiration scenario cannot be driven.          |
+| [ ] 5 Q: max note size   |                                                |
+|                          | Proposal                                       |
+|                          | Drive: POST /test/clock {now} when             |
+|                          | HEIDENG_TEST_CLOCK=1                           |
+|                          |                                                |
+|                          | Correction                                     |
+|                          | > use env FAKE_NOW instead of an endpoint_     |
++--------------------------+------------------------------------------------+
+| up/down item  enter confirm  e correct  E $EDITOR  s send  q quit         |
++---------------------------------------------------------------------------+
+```
+
+- Left: the gaps (with their Run / Drive / Observe section) and the questions, numbered, with their state: `[ ]` open, `[x]` proposal confirmed, `[~]` corrected.
+- Right: the selected item, with the quote from the spec it comes from, the reason for the gap or the question, the proposal and the correction field.
+- Keys: `up`/`down` (or `k`/`j`) select; `enter` confirms the proposal; `e` edits the correction inline (multi-line, `ctrl-s` saves, `esc` cancels); `E` opens the correction in `$EDITOR`; `s` sends the answers when every item has one, and the gate session resumes; `q` asks for confirmation and closes `accept` with exit code 3.
+
+Confirmation screen, before the commit:
+
+- Three tabs (`tab` switches): ACs (id and text), superseded ACs (`spec-A/AC-3` with modified or removed), contract delta as a diff per section (Run, Drive, Observe).
+- Keys: `y` commits; `e` on an AC or a delta line writes a correction that goes back to the gate session as an answer, then the screen reopens with the new proposal; `q` closes with exit code 3.
+
+After the commit the TUI closes and the CLI prints on stdout: branch, commit sha, `spec.lock` version, paths of `spec.md`, `acceptance.md` and `contract.md`, next command `heideng run <spec>`.
 
 #### Other commands
 
@@ -883,6 +933,9 @@ heideng state:
   run.lock
   env                         app variable values
   holdout/                    verify/, scenarios/, replays/, retired/
+  gate/<slug>/                state of heideng accept, before any run
+    events.jsonl
+    nodes/gate/v<n>/          same layout as a run's nodes/<exec>/
   runs/<run>/
     run.json
     events.jsonl
@@ -895,6 +948,8 @@ heideng state:
     clones/<ticket>/
     nodes/<exec>/
       stream.jsonl
+      qa.json                 questions and answers of the execution
+      claude/                 Claude Code config dir (sessions), mounted as CLAUDE_CONFIG_DIR
       attempt-<n>/  prompt.md  response.md  status.json
 ```
 
@@ -905,6 +960,20 @@ heideng state:
 | Containers, app and proxy networks | removed at the end of the node or run (`--rm`) |
 | Ticket clones | kept while the run is open (needed for resume); removed after the merge into main or `heideng close` |
 | `heideng-<project>:<hash>` images | the current and previous ones kept; the others removed at the start of the run |
-| `heideng-base`, `heideng-verify` | the ones for the current heideng version kept |
+| `heideng-base`, `heideng-verify` | the ones with the current definition hash kept |
 | Dependency cache volume | kept |
 | Events, streams, evidence, reports | kept (history, `heideng stats`) |
+
+## Testability
+
+heideng is verified through its binary with `claude` replaced by a stub. Three seams, read from env and absent from `--help` and README:
+
+| Variable | Replaces | Containers | What it proves |
+|---|---|---|---|
+| `HEIDENG_CLAUDE_BIN` | `claude`, run directly on the host | none | graph, routing, budgets, events, CLI, UI |
+| `HEIDENG_RUNTIME_BIN` | the podman/docker binary | recorded, not started | container argv, cleanup |
+| `HEIDENG_CLAUDE_STUB_DIR` | only `claude` inside the containers: the dir is mounted at `/heideng-stub` and `/heideng-stub/claude` is the command, with `HEIDENG_NODE` and `HEIDENG_EXEC` in the env | real podman/docker | images, egress proxy and internal network, secrets, mounts, user and permissions, sessions across containers |
+
+- `HEIDENG_CLAUDE_BIN` wins when both claude seams are set. A `HEIDENG_CLAUDE_STUB_DIR` without an executable `claude` rejects `accept` and `run` with exit code 5.
+- Container behavior (build behind the proxy, `--internal` network, non-root mounts, cache volume, session persistence) is proven only with `HEIDENG_CLAUDE_STUB_DIR` on a real runtime; the other seams never execute it.
+- The stubs reproduce the Claude Code behaviors the engine depends on: a new `session_id` per call stored under `CLAUDE_CONFIG_DIR`, `--resume` of an unknown session fails with `No conversation found with session ID`, the `result` message with `structured_output`, cost and errors. A stub that accepts any `--resume` hides the loss of sessions between containers.
