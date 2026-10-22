@@ -34,6 +34,7 @@ Heideng (黑灯工厂, hēidēng gōngchǎng, "lights-out factory") is a CLI tha
 | Scenario | Natural-language acceptance test (intent and assertions) tied to one or more ACs |
 | Replay | Executable test (Playwright or script) of a scenario |
 | Ticket | Unit of work for an implement agent. Id prefix by origin: `T-<NN>` Ticket from the tickets node, `F-<n>` Fix from verify and regression, `R-<n>` Review from blocking notes |
+| Plan | Ticket breakdown approved by the ticket oracle, with its decisions and merge ledger. It belongs to a `spec.lock` version, and every run on that version executes it |
 | Visit | One pass of a ticket through implement + test |
 | Wave | Tickets whose dependencies are already merged, run in parallel (at most `parallel`) |
 | Round | Waves repeated until the queue is empty or the remaining tickets are all blocked, then review and verify |
@@ -181,7 +182,15 @@ The gate is the only step of a spec where a person takes part. The node uses the
 4. Compares with the ACs of active specs and lists the superseded ones (`spec-A/AC-3` modified or removed).
 5. On confirmation it creates the `heideng/<slug>` branch from `main` and commits to it the completed spec in `.heideng/specs/<slug>/spec.md`, `acceptance.md`, the delta applied to `contract.md` and `.heideng/specs/<slug>/spec.lock`: version, hashes of `spec.md`, `acceptance.md` and `contract.md`, plus the list of superseded ACs.
 
-`heideng run` rejects a spec without a lock, with a lock that differs from the files on the branch, or with a `heideng/<slug>` branch that does not start from `main`. A `heideng accept` with an open run on the same spec adds a commit on the branch and increments the lock version; the report states the round in which the lock changed.
+`heideng run` rejects a spec without a lock, with a lock that differs from the files on the branch, with a `heideng/<slug>` branch that does not start from `main`, with `heideng/<slug>` checked out in the project repo, or with a run of the same spec already merged on the current `spec.lock`. `heideng resume` rejects `heideng/<slug>` checked out in the project repo. Every rejection happens before any node runs.
+
+A `heideng accept` with an open run on the same spec adds a commit on the branch and increments the lock version; the report states the round in which the lock changed. The open run keeps its tickets and the spec's saved plan is discarded.
+
+A `heideng accept` with no open run on the spec:
+- last run of the spec not merged (failed, aborted, closed): starts from the existing `heideng/<slug>`, keeps its commits and increments the lock version. The plan of the previous version is no longer valid, so the next run plans again on top of the code on the branch;
+- last run merged: rejected, the branch belongs to a merged run.
+
+A new `heideng accept` is the only way to plan a spec again.
 
 ## Holdout
 
@@ -214,14 +223,42 @@ holdout-gen generates the holdout from spec, contract and `acceptance.md`, in a 
   - traceability: every AC has at least one scenario and every scenario cites existing ACs;
   - parsing: replay typecheck, `playwright test --list`;
   - skill: frontmatter and sections present.
-- Holdout oracle: AC coverage and non-trivial assertions. This check catches empty or trivial scenarios.
+- Holdout oracle: AC coverage and non-trivial assertions. This check catches empty or trivial scenarios. With `maintain` it judges the scenarios and replays of the added and modified ACs plus AC coverage of the whole `acceptance.md`; scenarios of unchanged ACs keep the verdict they already have.
 - A tool check that cannot run (the tool exits with a usage or configuration error before reading the holdout, missing image or binary) is an engine `error`, exit code 4, with the tool output in the message. It never returns as `issues` to holdout-gen and never counts toward `oracle_rounds`, because no change to spec, contract or holdout fixes it.
+
+### Reuse
+
+- When the holdout oracle returns `ok`, the holdout manifest records the `spec.lock` hash it was validated for.
+- At the start of a run holdout-gen and the holdout oracle are skipped when all three hold: the manifest is validated for the current `spec.lock` hash, no AC of the spec is added, modified or removed, and the hashes of scenarios and replays match the manifest. The skip is an event of the run. Otherwise holdout-gen runs as above.
 
 ### Immutability
 
 Inside a run scenarios and replays are immutable. The engine rechecks their hashes and verify runs them without playwright-cli's test generation and repair features. Between specs they change only through gate and holdout-gen. Baseline and regression use only active scenarios.
 
 ## Tickets
+
+### Plan
+
+The ticket breakdown belongs to the accepted spec version, and runs execute it.
+
+| Rule | Detail |
+|---|---|
+| Location | `~/.heideng/<project>/plans/<slug>/`, outside the project repo |
+| Key | hash of the whole `spec.lock` file, version included. Every `accept` produces a new key, also with identical content |
+| Content | the approved `T-<NN>` tickets, the bootstrap flag, the ticket-gate decisions, the product decisions, the merge ledger, the run that produced it |
+| Written | right after the ticket oracle approves the breakdown, before the first wave |
+| Product decisions | every `uncovered` decision and every responder answer is appended as it is taken, whatever the state of the ticket that took it. Later runs receive them in `decisions.md` |
+| Not in the plan | tickets written by the engine (`F-<n>`, `R-<n>`): they belong to the run that wrote them |
+| Valid | the stored key equals the hash of the current `spec.lock` |
+| Discarded | a different key replaces the whole plan; `accept` with an open run; `heideng close --delete-branch` |
+
+Merge ledger:
+- When the integration branch reaches the project's `heideng/<slug>`, the plan records `T-<NN> -> <sha of the merge commit>` for every plan ticket merged there.
+- A plan ticket is done when the ledger has its sha and `git merge-base --is-ancestor <sha> heideng/<slug>` holds. A ticket whose sha is no longer an ancestor (branch reset or rewritten) is queued again.
+
+A run that finds a valid plan skips the tickets node, the ticket oracle and graph-check. Its ticket state starts from the plan: done tickets `merged`, the others `queued`. `T-01` is the bootstrap only while it is not done. The report states the run the plan comes from.
+
+### Ticket files
 
 - The engine writes tickets to `runs/<run>/tickets/<id>.md`; after creation they are immutable.
 - Status and visit live only in `run.json` and only the engine changes them.
@@ -246,10 +283,14 @@ Body of the to-tickets file: What to build, Blocked by, acceptance criteria.
 2. The agent runs `/to-tickets <spec>`, which writes one file per ticket in `.scratch/<slug>/issues/<NN>-<slug>.md`. heideng's prompt adds the rules:
    - every ticket has a `**Covers:** AC-1, AC-2` line with the ids from `acceptance.md` (`**Covers:** AC-0` for the bootstrap);
    - the quiz shows the Covers line and the acceptance criteria for each ticket;
+   - the clone may already contain part of the work: the breakdown covers only what the spec still requires on top of the existing code;
    - without `.heideng/Dockerfile` in the repo, `01` is the bootstrap and every other ticket depends on `01`. The bootstrap contains only stack, `.heideng/Dockerfile`, `.heideng/test`, `.heideng/build`, `.heideng/start`, a runnable skeleton and a smoke test; domain foundations (models, identity, base pages) are tickets of their own.
 3. The skill's questions, quiz included, go to the ticket oracle.
 4. The engine converts the files: `id` = `T-<NN>` from the file number; `deps` from the tickets cited in "Blocked by"; `ac` from the Covers line; body unchanged.
 5. Graph-check.
+6. The approved breakdown becomes the spec's plan.
+
+The node runs only when the spec has no valid plan.
 
 ### Ticket oracle
 
@@ -756,7 +797,7 @@ git diff --stat main...heideng/<slug>
 | `heideng resume [run]` | with a live engine (pid in `run.lock`) writes `resume` to `control.jsonl`; otherwise relaunches the engine on the node in progress | `--add-usd`, `--add-rounds`, `--add-time` |
 | `heideng resolve <id> "note"` | closes an escalation with a decision | - |
 | `heideng pause [run]` / `heideng abort [run]` | write to `control.jsonl` | - |
-| `heideng close <run>` | closes a stopped run and releases the lock; with `--delete-branch` moves the spec's holdout to `retired/` | `--delete-branch` |
+| `heideng close <run>` | gives up on a run: closes it and releases the lock; branch and plan stay for the next run. With `--delete-branch` it deletes the branch and the spec's plan and moves the spec's holdout to `retired/` | `--delete-branch` |
 | `heideng status` | active run, open escalations | `--all`, `--json` |
 | `heideng ui [run]` | opens the UI | `--port` |
 | `heideng stats` | aggregated costs across runs | `--json` |
@@ -773,7 +814,7 @@ Exit codes of `run` and `resume`:
 | 2 | budget stop |
 | 3 | manual abort |
 | 4 | engine error |
-| 5 | run rejected (invalid spec lock, run already active) |
+| 5 | run rejected (invalid spec lock, run already active, branch checked out, spec already merged on this lock) |
 
 Exit codes of the other commands: 0 success, 3 `accept` closed by the person without confirmation, 4 engine error, 5 rejected (invalid arguments, unknown id, unmet precondition, `accept` without TTY).
 
@@ -879,7 +920,7 @@ After the commit the TUI closes and the CLI prints on stdout: branch, commit sha
 | `init` | detected stack, package manager and commands; created files, each with its path; skipped files that already exist (overwritten with `--force`); a warning for an `AGENTS.md` not included by `CLAUDE.md`, with the line to add |
 | `pause`, `abort`, `resume` with a live engine | writes `control.jsonl` and prints `requested`; then shows the live area until the `control` event with `phase: applied` and prints `applied`. Ctrl-C detaches the CLI and the request stays valid |
 | `resolve` | closed escalation, note written to `decisions.md`, tickets back to `queued`, next command `heideng resume <run>` |
-| `close` | closed run, lock released, clones removed, with `--delete-branch` the deleted branch and the scenarios moved to `retired/` |
+| `close` | closed run, lock released, clones removed, with `--delete-branch` the deleted branch, the deleted plan and the scenarios moved to `retired/` |
 | `status` | active run with state, round, cost and budgets, running nodes; table of open escalations (run, id, reason, command to close it); `--all` adds the closed runs |
 | `ui` | URL with token |
 | `stats` | table per run (spec, outcome, cost, verified ACs, cost per verified AC) and the project total |
@@ -933,6 +974,7 @@ heideng state:
   run.lock
   env                         app variable values
   holdout/                    verify/, scenarios/, replays/, retired/
+  plans/<slug>/               plan of the spec: tickets, decisions, merge ledger, spec.lock key
   gate/<slug>/                state of heideng accept, before any run
     events.jsonl
     nodes/gate/v<n>/          same layout as a run's nodes/<exec>/
