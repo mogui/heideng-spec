@@ -16,7 +16,7 @@ Heideng (黑灯工厂, hēidēng gōngchǎng, "lights-out factory") is a CLI tha
 
 1. **The engine decides the path, the agent does the work.** Routing between nodes is deterministic code that evaluates outcomes, counters and budgets. Inside a node the agent works with its own tool-call loop and returns structured output. The same state always produces the same route, and a run restarts from any node boundary.
 2. **Every loop has two stops.** The success stop comes when a check other than whoever did the work judges it done. The budget stop closes the loop with a written reason. Retries (`retries`) repeat a node only on transient errors. Every loop in the graph (ticket visits, rounds, run, progress between rounds) has its own limit. Every stop produces a `stop` event and a line in the report.
-3. **Verification stays out of the worker's reach.** The project's tests give the worker an immediate signal inside its loop. Holdout scenarios decide "done", and the worker neither sees nor modifies them. A worker that sees its own verifier optimizes the verifier instead of the goal.
+3. **The worker cannot see or change its verifier.** The project's tests give the worker an immediate signal inside its loop. Holdout scenarios decide "done", and the worker neither sees nor modifies them. A worker that sees its own verifier optimizes the verifier instead of the goal.
 4. **The cheapest check able to settle the outcome decides.** The engine runs deterministic code first (exit codes, hashes, traceability, parsing), then an LLM judge for what code cannot assess. Judges run on a model different from the worker's and start from a clean context. Workers and judges come from the same family and fail in partly correlated ways, so the deterministic checks decide "done" (replay exit codes, traceability, `.heideng/test`). More retries do not fix a judge with false positives.
 5. **The node boundary is the unit of durability.** After every node the engine saves state and output; a crash loses only the node in progress, which restarts from scratch on resume. Useful state lives in files, never only in a model's session. Every side effect inside a node is repeatable (check-then-act, deterministic keys).
 6. **Work without judgment goes into tool nodes.** Clone, test, merge, bisect, traceability, ticket templates, ledger and route are engine code and cost zero tokens.
@@ -173,7 +173,7 @@ For web apps replays use user-facing Playwright locators (`getByRole`, `getByLab
 
 ### Gate: `heideng accept <spec>`
 
-The gate is the only step of a spec where a person takes part. The node uses the same mechanism as the other llm nodes (see [Questions and answerers](#questions-and-answerers)): on `needs_input` heideng shows proposals and questions in a TUI (see [`accept`](#accept)), collects the person's answers and resumes the session with `--resume`.
+The gate is the only step of a spec where a person takes part. The node uses the same mechanism as the other llm nodes (see [Questions and answerers](#questions-and-answerers)). On `needs_input` heideng shows proposals and questions in a TUI (see [`accept`](#accept)), collects the person's answers and resumes the session with `--resume`.
 
 1. Checks the spec with the Run / Drive / Observe checklist: verifiable behaviors, contract delta for each section.
 2. For each gap it proposes an addition; the person confirms or corrects.
@@ -267,7 +267,7 @@ Body of the to-tickets file: What to build, Blocked by, acceptance criteria.
 | kind | Meaning |
 |---|---|
 | `too_big` | cannot be completed in one visit |
-| `ac_shallow` | AC cited but not really covered by the body |
+| `ac_shallow` | the ticket cites the AC but its body does not cover it |
 | `missing_dep` | undeclared implicit dependency |
 | `test_only` | tests only, no behavior |
 | `vague` | no local way to tell it is done |
@@ -402,8 +402,8 @@ Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions
 
 - The output schema of every `llm` node has the `needs_input` status with `questions[]`. heideng's system prompt requires that when a skill asks the user, the node stops with `needs_input` and includes the proposal it asks confirmation for.
 - On `needs_input` the engine runs the node's answerer (the person in the gate, the ticket oracle in the tickets node, the responder elsewhere), then resumes the session with `--resume <session_id>` and the answers in the prompt.
-- Containers are removed at the end of each attempt, so sessions live outside them: every node execution has its own Claude Code config dir `nodes/<exec>/claude/`, created before the first attempt and mounted read-write in each container of that execution as `CLAUDE_CONFIG_DIR`. A tickets pass that resumes the previous pass's session (graph-check errors) mounts the dir of the first pass.
-- Every question and answer of an execution is saved in `nodes/<exec>/qa.json` as soon as it is given. A rerun of the same execution (resume, `accept` after an error) starts from the saved answers and asks only the open questions.
+- The engine removes containers at the end of each attempt, so sessions live outside them. Every node execution has its own Claude Code config dir `nodes/<exec>/claude/`, created before the first attempt and mounted read-write in each container of that execution as `CLAUDE_CONFIG_DIR`. A tickets pass that resumes the previous pass's session (graph-check errors) mounts the dir of the first pass.
+- The engine saves every question and answer of an execution in `nodes/<exec>/qa.json` as soon as the answerer gives it. A rerun of the same execution (resume, `accept` after an error) starts from the saved answers and asks only the open questions.
 - When the session is gone (crash, `No conversation found with session ID` on `--resume`), the next attempt restarts from scratch with the node's full prompt plus every answer already given to that node, previous passes included. The failed resume counts as one attempt; the from-scratch restart happens at most once per execution.
 - Every question with its answer goes to `decisions.md` and to the `question` event. `uncovered` answers end up in "To do for you" in the report.
 
@@ -439,7 +439,7 @@ Every non-empty `source` must appear verbatim in spec, `contract.md`, `acceptanc
 | Scenario | verdict other than `unknown` | `unknown` for `unknown_rounds` rounds: escalation | `progress` / `unknown_rounds` |
 | Progress | - | same set of failed scenarios for `stall_rounds` rounds: stop with escalation | `progress` / `stall_rounds` |
 
-The docs node has no stop: with a red check or exhausted budget the engine discards the changes and the run proceeds (see [Docs](#docs-llm--tool)).
+The docs node has no stop. With a red check or exhausted budget the engine discards the changes and the run proceeds (see [Docs](#docs-llm--tool)).
 
 ### `error` and `budget` outcomes of an llm node
 
@@ -552,7 +552,7 @@ The engine has a TypeScript schema for each version. The server converts old run
 | `heideng-verify` | `heideng-base` + Playwright with browsers + playwright-cli with its skill + `heideng-exec` | holdout-gen, verify | heideng |
 | `heideng-<project>:<hash>` | `FROM heideng-base` + project stack | implement, test, review, app under test | engine, from `.heideng/Dockerfile` |
 
-- `heideng-base` and `heideng-verify` are tagged with the hash of their build definition. A heideng change that alters the definition produces a new tag and a rebuild, with no manual removal of old images.
+- The engine tags `heideng-base` and `heideng-verify` with the hash of their build definition. A heideng change that alters the definition produces a new tag and a rebuild, with no manual removal of old images.
 - Every tool installed in the heideng images has a version pinned by heideng (Claude Code, TypeScript, Playwright, playwright-cli). A major release of a tool can change its CLI (TypeScript 7 removed `baseUrl`), and an unpinned version breaks the checks of every run at once.
 - Replays import packages installed globally in `heideng-verify` (`@playwright/test`); the image makes them resolvable by standard module resolution from any directory, so typecheck and `playwright test --list` need no path options.
 - With docker the engine builds with the classic builder, because BuildKit rejects `--network` to a user network and every build goes through the egress proxy. Podman accepts it.
@@ -568,7 +568,7 @@ The engine has a TypeScript schema for each version. The server converts old run
 - Agents write the Dockerfile, so the project image build also goes through the proxy, with the allowlist extended to package mirrors (`container.build_allow`).
 - `heideng init` derives `allow` from the detected package manager: `api.anthropic.com` plus its registries (npm, pnpm, bun: `registry.npmjs.org`; yarn: also `registry.yarnpkg.com`, `repo.yarnpkg.com`; pip, uv, poetry: `pypi.org`, `files.pythonhosted.org`; go: `proxy.golang.org`, `sum.golang.org`). `build_allow` adds the OS package mirror; builds use `allow + build_allow`.
 - The builds of `heideng-base` and `heideng-verify` use an allowlist fixed in heideng (Debian and npm mirrors, Playwright's browser download hosts `cdn.playwright.dev` and `storage.googleapis.com`), independent of the project config.
-- The proxy logs every host it refuses. When a build or a node fails, the engine reads the proxy log before stopping it and names the blocked hosts in the error: `-> add <host> to container.build_allow in heideng.yaml` for project images, "report it as a heideng bug" for heideng images. Install scripts download from hosts no table can predict (browsers, prebuilt binaries), so the error is what makes the allowlist manageable.
+- The proxy logs every host it refuses. When a build or a node fails, the engine reads the proxy log before stopping it and names the blocked hosts in the error: `-> add <host> to container.build_allow in heideng.yaml` for project images, "report it as a heideng bug" for heideng images. Install scripts download from hosts no table can predict (browsers, prebuilt binaries), so the person extends the allowlist from these errors.
 
 ### Credentials
 
@@ -595,7 +595,7 @@ run(prompt, { cwd, model, effort, schema, budget, resume? }) -> { output, cost, 
 - Structured output is the `structured_output` of the `result` message.
 - Claude Code loads skills natively. heideng invokes those with `disable-model-invocation: true` in the prompt as a command (`/to-tickets <spec>`).
 - `--resume <session_id>` resumes the session after the answerer's answers. The session is found only in the execution's config dir (see [Questions and answerers](#questions-and-answerers)).
-- In containers `claude` runs with `--permission-mode bypassPermissions`. In `-p` mode nobody can approve a permission prompt, so any other mode denies writes and compound commands and the node stalls asking where it may write. The container is the boundary: mounts, network and user decide what the agent can touch.
+- In containers `claude` runs with `--permission-mode bypassPermissions`. In `-p` mode nobody can approve a permission prompt, so any other mode denies writes and compound commands and the node stalls asking where it may write. The container's mounts, network and user limit what the agent can read, write and reach.
 
 ### Prompts and skills
 
@@ -782,7 +782,7 @@ Exit codes of the other commands: 0 success, 3 `accept` closed by the person wit
 Common rules:
 - Results go to stdout; live feedback, warnings and errors go to stderr.
 - An error is two lines: `error: <what>` and `-> <command or file that resolves it>` (e.g. `error: spec.lock differs from acceptance.md` / `-> heideng accept notes-sharing`).
-- With a TTY the output uses colors and redraws in place. Without a TTY or with `NO_COLOR` it has no colors and no redraw: the live area becomes one line per event (see below).
+- With a TTY the output uses colors and redraws in place. Without a TTY or with `NO_COLOR` it has no colors and no redraw, and the live area becomes one line per event (see below).
 - `--json` on `status` and `stats` prints a single JSON document on stdout.
 
 #### Live area: `run`, `resume`
