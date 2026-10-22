@@ -667,7 +667,7 @@ The project customizes the phases without touching heideng's prompts and skills.
 
 ### Process
 
-- `heideng ui` is a separate process; it reads the run directory and writes only to `control.jsonl`. `heideng run` launches it automatically; the run does not depend on the UI and the UI stays openable after the run ends.
+- `heideng ui` is a separate process; it reads the run directory and writes only to `control.jsonl`. `heideng run` launches it automatically and stops it when the run exits; the run does not depend on the UI, and `heideng ui <run>` opens it on a finished run.
 - Actions write to `control.jsonl` (append-only). The engine reads it at the node boundary and confirms with a `control` event (`phase: applied`).
 - When paused the engine stays alive and waits at the node boundary. `run.lock` contains the engine's pid.
 - The UI binds only to `127.0.0.1`, with a token in the URL against requests from other pages.
