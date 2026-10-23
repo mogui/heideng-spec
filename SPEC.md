@@ -54,7 +54,7 @@ Heideng (黑灯工厂, hēidēng gōngchǎng, "lights-out factory") is a CLI tha
 - Standalone CLI in TypeScript (Node or Bun) with a fixed graph in code.
 - `tool` nodes are engine code, cost zero tokens and are idempotent. `llm` nodes run `claude -p` in a container (podman or docker). The gate is an `llm` node with the person as answerer, before the run.
 - State lives in files under `~/.heideng/<project>/`.
-- A local UI shows the run's state and result. It does not write run data; actions go only through `control.jsonl`.
+- A local UI shows the run's state and result and acts only through `control.jsonl` (see [Local UI](#local-ui)).
 
 ### Graph
 
@@ -330,7 +330,7 @@ The node runs only when the spec has no valid plan.
 The engine writes from templates, at zero tokens:
 - fix tickets, from verify verdicts and from broken replays in regression. They contain only what the worker may know: scenario id and short reason, or the missing contract element;
 - `review` tickets (`R-<n>`), from `blocking` notes. They go through graph-check.
-- An engine ticket is valid for one round. If the same scenario or note recurs in the next round, the engine writes a new ticket with `supersedes` and, in the prompt, the `summary` of the previous one. `patience` counts visits without progress within a round, and rounds without progress on the holdout.
+- An engine ticket is valid for one round. If the same scenario or note recurs in the next round, the engine writes a new ticket with `supersedes` and, in the prompt, the `summary` of the previous one.
 
 ## Execution
 
@@ -344,7 +344,7 @@ The engine writes from templates, at zero tokens:
 ### Implement
 
 - Image `heideng-<project>:<hash>`, or `heideng-base` for the `T-01` bootstrap. Mounts: clone on `/work` read-write, volume `heideng-<project>-<pm>` for the dependency cache.
-- Prompt: ticket, spec, `contract.md`, `acceptance.md`, `decisions.md`. With `visit > 1` it adds the compressed output of the red tests or the conflict note. Fix tickets use the template.
+- Prompt: as in [llm nodes](#llm-nodes). With `visit > 1` it adds the compressed output of the red tests or the conflict note. Fix tickets use the template.
 - Every visit is a new session. Its context is the clone with the diff, the ticket and the compressed test output.
 - `decisions[]` are the choices the worker made where ticket and documents do not decide; the engine writes them to `decisions.md` as `uncovered` and to the report.
 - Skills:
@@ -360,7 +360,7 @@ The engine writes from templates, at zero tokens:
 
 - New container, same image and same clone; runs `project.test`, or `.heideng/test` if not set. Only the exit code the engine observes counts.
 - With `project.test` set, the bootstrap and implement prompts state the command used and that `.heideng/test` is not run. The same holds for `project.build` and `project.start`.
-- If red, the engine increments `visit` and relaunches implement on the same clone, with the compressed output in the prompt. After `patience` visits without progress (the red tests neither change nor decrease) the ticket becomes `failed` and its dependents stay blocked; the run continues and verify reports the scenarios the ticket left failing.
+- If red, the engine increments `visit` and relaunches implement on the same clone, with the compressed output in the prompt. After `patience` visits without progress the ticket becomes `failed` and its dependents stay blocked; the run continues and verify reports the scenarios the ticket left failing.
 - Compression, at zero tokens: only failed tests with message and stack trace, repeated lines collapsed; if the format is not recognized, the tail of the output. The full output stays in `nodes/<exec>/`.
 - Every tool node that runs project code (test, build, wave-test, replay, getting started) has a timeout of 20 minutes; when it expires the outcome is red with the note "timeout".
 
@@ -478,19 +478,17 @@ A loop stops when its work stops progressing.
 - A safety cap of `max_passes` passes per loop, configurable and high by default, ends a loop that keeps changing without converging.
 - `usd_per_run` and `wall_clock` bound the whole run. `wall_clock` counts only the time the run is `running`: a stop or a pause halts it.
 
-| Loop | Success stop | Progress |
-|---|---|---|
-| Run (rounds) | holdout and regression green | the set of failed or `unknown` scenarios changes |
-| Ticket (visits) | green tests + merge | the red tests change or decrease |
-| llm node session | valid output against the schema | the session changed files or output since the previous pass |
-| Holdout oracle, ticket oracle | `ok: true` | `fixed` >= 1: the oracle reports how many issues of the previous judgment are fixed |
-| Holdout tool check, graph-check | all checks pass | the set of check errors changes |
-| Questions | `status` other than `needs_input` | the node asks no question it already had answered |
-| Harness | `harness_gap` repaired | the repaired scenario does not return `harness_gap` |
+| Loop | `loop` | Success stop | Progress |
+|---|---|---|---|
+| Run (rounds) | `rounds` | holdout and regression green | the set of failed or `unknown` scenarios changes |
+| Ticket (visits) | `visits` | green tests + merge | the red tests change or decrease |
+| llm node session | `holdout-gen`, `tickets` | valid output against the schema | the session changed files or output since the previous pass |
+| Holdout oracle, ticket oracle | `holdout-oracle`, `ticket-oracle` | `ok: true` | `fixed` >= 1: the oracle reports how many issues of the previous judgment are fixed |
+| Holdout tool check, graph-check | `holdout-check`, `graph-check` | all checks pass | the set of check errors changes |
+| Questions | `questions` | `status` other than `needs_input` | the node asks no question it already had answered |
+| Harness | `harness` | `harness_gap` repaired | the repaired scenario does not return `harness_gap` |
 
-The `stop` event of a loop has kind `no_progress` or `max_passes` and a `loop` field naming the loop (`rounds`, `visits`, `holdout-gen`, `holdout-oracle`, `holdout-check`, `tickets`, `ticket-oracle`, `graph-check`, `questions`, `harness`). The run budgets stop with kind `usd` or `wall_clock`. Messages read `<loop>: no progress in <patience> passes`.
-
-The docs node has no stop. With a red check or exhausted budget the engine discards the changes and the run proceeds (see [Docs](#docs-llm--tool)).
+The `stop` event of a loop has kind `no_progress` or `max_passes` and the `loop` field from the table. The run budgets stop with kind `usd` or `wall_clock`. Messages read `<loop>: no progress in <patience> passes`.
 
 ### `error` and `budget` outcomes of an llm node
 
@@ -511,7 +509,7 @@ The docs node has no stop. With a red check or exhausted budget the engine disca
 ### Escalation
 
 - The engine writes every escalation from a template in `runs/<run>/escalations/<id>.md`: what happened, why, evidence, ways to close it. The status lives in `run.json`.
-- Every escalation produces a `stop` event (`level: run`). Route stops the run at the end of the round if it has open escalations; `heideng resolve` closes them and `heideng resume` restarts from the next round.
+- Every escalation produces a `stop` event (`level: run`) and stops the run as described under [Graph](#graph); `heideng resolve` closes them and `heideng resume` restarts from the next round.
 - `heideng status` lists the open escalations of all the project's runs.
 - Ways to close:
   - missing decision: `heideng resolve <id> "note"` writes the note to `decisions.md`, requeues the ticket and resets the `patience` count of the rounds; then `heideng resume` on the same run;
@@ -568,7 +566,7 @@ The catalog is closed. A new type requires `v+1`.
 | `decision` | text, uncovered |
 | `question` | questions, answerer, answers, issues, sources, uncovered |
 | `escalation` | ticket or scenario, reason |
-| `stop` | `level: run\|ticket\|node\|progress`, `kind` ("`stop` event" column of the [Stop](#stop) table), reason |
+| `stop` | `level: run\|ticket\|node\|progress`, `kind` and `loop` (see [Stop](#stop)), reason |
 | `control` | `action: pause\|resume\|abort\|extend\|resolve`, `phase: requested\|applied` |
 | `cost` | `run_usd`, `exec_usd` |
 
@@ -669,7 +667,7 @@ The project customizes the phases without touching heideng's prompts and skills.
 - Docs phase: see .heideng/docs.md
 ```
 
-- Customizations add to heideng's behavior, and whoever writes them is responsible for them.
+- Customizations add to heideng's behavior.
 - Gate, holdout-gen, holdout oracle, verify and the responder for holdout-gen do not mount the repo and receive no customizations.
 - Checks expressible as scripts go in `.heideng/test`.
 
@@ -681,7 +679,6 @@ The project customizes the phases without touching heideng's prompts and skills.
 - Actions write to `control.jsonl` (append-only). The engine reads it at the node boundary and confirms with a `control` event (`phase: applied`).
 - When paused the engine stays alive and waits at the node boundary. `run.lock` contains the engine's pid.
 - The UI binds only to `127.0.0.1`, with a token in the URL against requests from other pages.
-- Prompts, tickets and scenarios change only through gate, escalation and `heideng resume`, never from the UI.
 
 ### Data
 
