@@ -15,7 +15,7 @@ Heideng (黑灯工厂, hēidēng gōngchǎng, "lights-out factory") is a CLI tha
 ## Principles
 
 1. **The engine decides the path, the agent does the work.** Routing between nodes is deterministic code that evaluates outcomes, counters and budgets. Inside a node the agent works with its own tool-call loop and returns structured output. The same state always produces the same route, and a run restarts from any node boundary.
-2. **Every loop has two stops.** The success stop comes when a check other than whoever did the work judges it done. The budget stop closes the loop with a written reason. Retries (`retries`) repeat a node only on transient errors. Every loop in the graph (ticket visits, rounds, run, progress between rounds) has its own limit. Every stop produces a `stop` event and a line in the report.
+2. **Every loop has two stops.** The success stop comes when a check other than whoever did the work judges it done. The budget stop closes the loop with a written reason: `patience` passes without progress, the `max_passes` safety cap, or the run's `usd_per_run` and `wall_clock`. Retries repeat a node only on transient errors. Every stop produces a `stop` event and a line in the report.
 3. **The worker cannot see or change its verifier.** The project's tests give the worker an immediate signal inside its loop. Holdout scenarios decide "done", and the worker neither sees nor modifies them. A worker that sees its own verifier optimizes the verifier instead of the goal.
 4. **The cheapest check able to settle the outcome decides.** The engine runs deterministic code first (exit codes, hashes, traceability, parsing), then an LLM judge for what code cannot assess. Judges run on a model different from the worker's and start from a clean context. Workers and judges come from the same family and fail in partly correlated ways, so the deterministic checks decide "done" (replay exit codes, traceability, `.heideng/test`). More retries do not fix a judge with false positives.
 5. **The node boundary is the unit of durability.** After every node the engine saves state and output; a crash loses only the node in progress, which restarts from scratch on resume. Useful state lives in files, never only in a model's session. Every side effect inside a node is repeatable (check-then-act, deterministic keys).
@@ -36,6 +36,9 @@ Heideng (黑灯工厂, hēidēng gōngchǎng, "lights-out factory") is a CLI tha
 | Ticket | Unit of work for an implement agent. Id prefix by origin: `T-<NN>` Ticket from the tickets node, `F-<n>` Fix from verify and regression, `R-<n>` Review from blocking notes |
 | Plan | Ticket breakdown approved by the ticket oracle, with its decisions and merge ledger. It belongs to a `spec.lock` version, and every run on that version executes it |
 | Visit | One pass of a ticket through implement + test |
+| Pass | One attempt of a loop: an oracle judgment, a check, a visit, a round, a node session up to its turn limit |
+| Progress | What a pass changed against the previous pass of the same loop. Each loop defines it (see [Stop](#stop)) |
+| Patience | Consecutive passes without progress a loop tolerates; any progress resets the count |
 | Wave | Tickets whose dependencies are already merged, run in parallel (at most `parallel`) |
 | Round | Waves repeated until the queue is empty or the remaining tickets are all blocked, then review and verify |
 | Run | Full execution of the pipeline on a spec |
@@ -224,7 +227,8 @@ holdout-gen generates the holdout from spec, contract and `acceptance.md`, in a 
   - parsing: replay typecheck, `playwright test --list`;
   - skill: frontmatter and sections present.
 - Holdout oracle: AC coverage and non-trivial assertions. This check catches empty or trivial scenarios. With `maintain` it judges the scenarios and replays of the added and modified ACs plus AC coverage of the whole `acceptance.md`; scenarios of unchanged ACs keep the verdict they already have.
-- A tool check that cannot run (the tool exits with a usage or configuration error before reading the holdout, missing image or binary) is an engine `error`, exit code 4, with the tool output in the message. It never returns as `issues` to holdout-gen and never counts toward `oracle_rounds`, because no change to spec, contract or holdout fixes it.
+- After an `ok: false` the next judgment receives its issues and only the scenarios and replays holdout-gen changed since, plus AC coverage of the whole `acceptance.md`. It returns `ok` when every issue is fixed and the changed files raise no new issue; files not changed keep the verdict of the previous judgment. `run.json` keeps the issues and the hashes of the judged files, so a resumed run judges the same way; an `ok` and a new `spec.lock` version clear them.
+- A tool check that cannot run (the tool exits with a usage or configuration error before reading the holdout, missing image or binary) is an engine `error`, exit code 4, with the tool output in the message. It never returns as `issues` to holdout-gen and never counts as a pass, because no change to spec, contract or holdout fixes it.
 
 ### Reuse
 
@@ -326,7 +330,7 @@ The node runs only when the spec has no valid plan.
 The engine writes from templates, at zero tokens:
 - fix tickets, from verify verdicts and from broken replays in regression. They contain only what the worker may know: scenario id and short reason, or the missing contract element;
 - `review` tickets (`R-<n>`), from `blocking` notes. They go through graph-check.
-- An engine ticket is valid for one round. If the same scenario or note recurs in the next round, the engine writes a new ticket with `supersedes` and, in the prompt, the `summary` of the previous one. `max_visits` counts attempts within a round, `stall_rounds` the rounds without progress on the holdout.
+- An engine ticket is valid for one round. If the same scenario or note recurs in the next round, the engine writes a new ticket with `supersedes` and, in the prompt, the `summary` of the previous one. `patience` counts visits without progress within a round, and rounds without progress on the holdout.
 
 ## Execution
 
@@ -356,9 +360,9 @@ The engine writes from templates, at zero tokens:
 
 - New container, same image and same clone; runs `project.test`, or `.heideng/test` if not set. Only the exit code the engine observes counts.
 - With `project.test` set, the bootstrap and implement prompts state the command used and that `.heideng/test` is not run. The same holds for `project.build` and `project.start`.
-- If red, the engine increments `visit` and relaunches implement on the same clone, with the compressed output in the prompt. Beyond `max_visits` the ticket becomes `failed`, its dependents stay blocked and the engine opens an escalation.
+- If red, the engine increments `visit` and relaunches implement on the same clone, with the compressed output in the prompt. After `patience` visits without progress (the red tests neither change nor decrease) the ticket becomes `failed` and its dependents stay blocked; the run continues and verify reports the scenarios the ticket left failing.
 - Compression, at zero tokens: only failed tests with message and stack trace, repeated lines collapsed; if the format is not recognized, the tail of the output. The full output stays in `nodes/<exec>/`.
-- Every tool node that runs project code (test, build, wave-test, replay, getting started) has `budgets.tool_timeout`; when it expires the outcome is red with the note "timeout".
+- Every tool node that runs project code (test, build, wave-test, replay, getting started) has a timeout of 20 minutes; when it expires the outcome is red with the note "timeout".
 
 ### Merge and wave-test (tool)
 
@@ -414,7 +418,7 @@ Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions
 ### Baseline and regression (tool)
 
 - Baseline runs at the start of the run and replays the previous active specs on `main`. The engine excludes the red ones from regression and notes them in the report.
-- Regression replays all active specs. The current spec's replays run in verify. If red, the engine writes fix tickets for the broken replays and opens a new round within `max_rounds`. Beyond the limit the run stops with an escalation.
+- Regression replays all active specs. The current spec's replays run in verify. If red, the engine writes fix tickets for the broken replays and opens a new round. Rounds without progress count toward `patience` like the rounds of verify.
 
 ### Docs (llm + tool)
 
@@ -468,29 +472,35 @@ Every non-empty `source` must appear verbatim in spec, `contract.md`, `acceptanc
 
 ### Stop
 
-| Loop | Success stop | Budget stop | `stop` event |
-|---|---|---|---|
-| Run | holdout and regression green | `usd_per_run`, `wall_clock`, `max_rounds` | `run` / `usd`, `wall_clock`, `max_rounds` |
-| Ticket | green tests + merge | `max_visits`: ticket `failed` | `ticket` / `max_visits` |
-| llm node | valid output against the schema | `--max-budget-usd`, or timeout + max turns | `node` / `usd`, `timeout`, `turns` |
-| Holdout oracle, ticket oracle | `ok: true` | `oracle_rounds` judgments with `ok: false`: run stop with escalation | `run` / `oracle_rounds` |
-| Graph-check | all checks pass | `oracle_rounds` passes: run stop with escalation | `run` / `graph_check` |
-| Questions | `status` other than `needs_input` | `max_questions` turns per node execution: escalation | `run` / `max_questions` |
-| Harness | `harness_gap` repaired | `harness_repairs` repairs per run: escalation | `run` / `harness_repairs` |
-| Scenario | verdict other than `unknown` | `unknown` for `unknown_rounds` rounds: escalation | `progress` / `unknown_rounds` |
-| Progress | - | same set of failed scenarios for `stall_rounds` rounds: stop with escalation | `progress` / `stall_rounds` |
+A stop is an exception: it happens when the work stops progressing, not after a fixed number of passes.
+
+- A loop continues while its passes make progress and stops with an escalation after `patience` consecutive passes without progress.
+- A safety cap of `max_passes` passes per loop, configurable and high by default, ends a loop that keeps changing without converging.
+- `usd_per_run` and `wall_clock` bound the whole run. `wall_clock` counts only the time the run is `running`: a stop or a pause halts it.
+
+| Loop | Success stop | Progress |
+|---|---|---|
+| Run (rounds) | holdout and regression green | the set of failed or `unknown` scenarios changes |
+| Ticket (visits) | green tests + merge | the red tests change or decrease |
+| llm node session | valid output against the schema | the session changed files or output since the previous pass |
+| Holdout oracle, ticket oracle | `ok: true` | at least one issue of the previous judgment is fixed |
+| Holdout tool check, graph-check | all checks pass | the set of check errors changes |
+| Questions | `status` other than `needs_input` | the node asks no question it already had answered |
+| Harness | `harness_gap` repaired | the repaired scenario does not return `harness_gap` |
+
+The `stop` event of a loop has kind `no_progress` or `max_passes` and a `loop` field naming the loop (`rounds`, `visits`, `holdout-gen`, `holdout-oracle`, `holdout-check`, `tickets`, `ticket-oracle`, `graph-check`, `questions`, `harness`). The run budgets stop with kind `usd` or `wall_clock`. Messages read `<loop>: no progress in <patience> passes`.
 
 The docs node has no stop. With a red check or exhausted budget the engine discards the changes and the run proceeds (see [Docs](#docs-llm--tool)).
 
 ### `error` and `budget` outcomes of an llm node
 
-- `error` (API, network, container that does not start): the engine repeats the same `exec` with `attempt+1` and backoff, up to `retries` attempts. The cost of interrupted attempts goes to the report. Beyond the limit the engine opens a `run`-level escalation and exits with code 4. These are the retries of principle 2.
-- `budget` (usd, timeout, turns): the partial content counts, so the engine does not repeat the node. Route applies the node's fallback:
+- `error` (API, network, container that does not start): the engine repeats the same `exec` with `attempt+1` and backoff, up to 2 attempts. The cost of interrupted attempts goes to the report. Beyond the limit the engine opens a `run`-level escalation and exits with code 4. These are the retries of principle 2.
+- `budget` (usd, timeout, turns): the per-call limits of `claude` (`--max-turns`, `--max-budget-usd`, timeout) are engine constants and bound one pass, not the node. The partial content counts. Route applies the node's fallback:
 
 | Node | Fallback on `budget` |
 |---|---|
 | implement | like a red test: `visit++`, note "budget exhausted, partial work committed" in the prompt |
-| gate, holdout-gen, tickets | escalation, stops immediately |
+| gate, holdout-gen, tickets | the engine resumes the session with `--resume` as a new pass; `patience` passes without progress (no file or output changed) stop with an escalation |
 | holdout oracle, ticket oracle | like `ok: false` |
 | responder | all answers `uncovered` |
 | review | round without notes, flagged in the report |
@@ -504,9 +514,9 @@ The docs node has no stop. With a red check or exhausted budget the engine disca
 - Every escalation produces a `stop` event (`level: run`). Route stops the run at the end of the round if it has open escalations; `heideng resolve` closes them and `heideng resume` restarts from the next round.
 - `heideng status` lists the open escalations of all the project's runs.
 - Ways to close:
-  - missing decision: `heideng resolve <id> "note"` writes the note to `decisions.md`, requeues the ticket and resets the `stall_rounds` counter; then `heideng resume` on the same run;
+  - missing decision: `heideng resolve <id> "note"` writes the note to `decisions.md`, requeues the ticket and resets the `patience` count of the rounds; then `heideng resume` on the same run;
   - spec or contract gap: edit, new `heideng accept` on the same open run (new `spec.lock` version, holdout updated with `maintain-...-from-spec`), then `heideng resume`, which opens a new round. Tickets already merged stay; modified ACs produce fix tickets from verify.
-- Resuming after a budget stop requires an explicit extension: `--add-usd 20`, `--add-rounds 2`, `--add-time 2h`.
+- `heideng resume` with no flag gives the limit that stopped the run a new allowance equal to its configured value: passes for a loop, `usd_per_run` for cost, `wall_clock` for time. `--add-usd 20`, `--add-passes 2` (raises `max_passes` of the stopped loop), `--add-time 2h` set a precise amount.
 - Extensions and resolutions produce `control` events and appear in the report.
 
 ## State, lock and resume
@@ -709,7 +719,7 @@ The project customizes the phases without touching heideng's prompts and skills.
 +--------------------------------------------------------------------------+
 ```
 
-- Header: spec, run, state, round and wave, budget bars (`usd_per_run`, `wall_clock`, `max_rounds`, `stall_rounds`), actions. If the run is stopped, a STOP line with the reason.
+- Header: spec, run, state, round and wave, budget bars (`usd_per_run`, `wall_clock` as active time), the current loop as `<loop> pass N/<max_passes>, no progress K/<patience>`, actions. If the run is stopped, a STOP line with the reason.
 - Timeline: the axis is run time, alternating bands per round, ticks every 30 minutes with the time.
   - Above the separator the engine nodes (holdout-gen, tickets, merge, wave-test, review, verify, ledger, docs, report); below, one row per ticket with a label colored by state.
   - One bar per execution or visit. Color by outcome: green ok, red failure (red tests, conflict, verify with failures), blue in progress, yellow escalation, gray interrupted attempt. Tooltip with label, times, outcome.
@@ -794,7 +804,7 @@ git diff --stat main...heideng/<slug>
 | `heideng init` | detects stack, package manager and commands; generates `heideng.yaml` (with the allowlists of the package manager, see [Egress](#egress)), empty `contract.md`, `.heideng/Dockerfile` if the stack is detectable, the Heideng section of `CLAUDE.md`; flags an `AGENTS.md` not included by `CLAUDE.md` | `--force` |
 | `heideng accept <spec>` | gate: `heideng/<slug>` branch with `spec.md`, `acceptance.md`, `contract.md`, `spec.lock` | `--plain` |
 | `heideng run <spec>` | starts the run and the UI | `--no-ui` |
-| `heideng resume [run]` | with a live engine (pid in `run.lock`) writes `resume` to `control.jsonl`; otherwise relaunches the engine on the node in progress | `--add-usd`, `--add-rounds`, `--add-time` |
+| `heideng resume [run]` | with a live engine (pid in `run.lock`) writes `resume` to `control.jsonl`; otherwise relaunches the engine on the node in progress | `--add-usd`, `--add-passes`, `--add-time` |
 | `heideng resolve <id> "note"` | closes an escalation with a decision | - |
 | `heideng pause [run]` / `heideng abort [run]` | write to `control.jsonl` | - |
 | `heideng close <run>` | gives up on a run: closes it and releases the lock; branch and plan stay for the next run. With `--delete-branch` it deletes the branch and the spec's plan and moves the spec's holdout to `retired/` | `--delete-branch` |
@@ -840,7 +850,7 @@ last: merge T-02 ok 9f3c2a1
 ```
 
 - Line 1: spec, run, UI URL with token (without `--no-ui`: no URL). It stays fixed for the whole run.
-- Line 2: round and wave, the `usd_per_run`, `wall_clock` and `stall_rounds` budgets, open escalations. Cost updates on every `cost` event.
+- Line 2: round and wave, the `usd_per_run` and `wall_clock` budgets, the current loop as `<loop> pass N/<max_passes>, no progress K/<patience>`, open escalations. Cost updates on every `cost` event.
 - One line per running node: spinner, `exec` in readable form (node, ticket, title, visit), current activity, elapsed time, node cost. The line disappears when the node ends.
 - Activity of an llm node: the last message of `stream.jsonl`, as tool and main argument (`Edit src/search/index.ts`, `Bash: npm test -- notes`, `Skill /tdd`) or the first line of the assistant text, truncated to the terminal width. On `needs_input`: `asking <answerer>: <first question>`.
 - Activity of a tool node: its current step (`replay notes-03 2/9`, `bisect 2/4`, `build heideng-notes:3fa1`, `seed`).
@@ -853,8 +863,8 @@ last: merge T-02 ok 9f3c2a1
 At the end the CLI clears the live area and prints on stdout:
 
 ```
-heideng notes-sharing  run 2026-10-17-a  stopped: max_rounds
-Branch heideng/notes-sharing  round 5/5  $48.20/50  5h51/6h00
+heideng notes-sharing  run 2026-10-17-a  stopped: rounds: no progress in 2 passes
+Branch heideng/notes-sharing  round 5  $48.20/50  5h51/6h00
 Holdout 11/14 pass  3 fail_product  |  tickets 12 merged, 1 failed  |  $4.38 per verified AC
 
 To do for you
@@ -866,7 +876,7 @@ Inspect
   UI           heideng ui 2026-10-17-a
   escalations  ~/.heideng/notes-sharing/runs/2026-10-17-a/escalations/
   diff         git diff --stat main...heideng/notes-sharing
-  next         heideng resume 2026-10-17-a --add-rounds 2
+  next         heideng resume 2026-10-17-a
 ```
 
 - Line 1: outcome as in `report.md` (`merged <sha>`, `stopped: <reason>`, `aborted`, `failed`).
@@ -935,8 +945,7 @@ After the commit the TUI closes and the CLI prints on stdout: branch, commit sha
 project: { test: "npm test" }
 container: { runtime: podman, allow: [api.anthropic.com, registry.npmjs.org], build_allow: [deb.debian.org, pypi.org, files.pythonhosted.org] }
 limits: { agents: 4 }
-budgets: { usd_per_run: 50, wall_clock: 6h, max_rounds: 5, max_visits: 3, stall_rounds: 2,
-           oracle_rounds: 2, unknown_rounds: 2, harness_repairs: 3, max_questions: 3, retries: 2, tool_timeout: 20m }
+budgets: { usd_per_run: 50, wall_clock: 6h, patience: 2, max_passes: 10 }
 nodes:
   gate:        { model: opus }
   holdout_gen: { model: opus }
