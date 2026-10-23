@@ -54,7 +54,7 @@ Heideng (黑灯工厂, hēidēng gōngchǎng, "lights-out factory") is a CLI tha
 - Standalone CLI in TypeScript (Node or Bun) with a fixed graph in code.
 - `tool` nodes are engine code, cost zero tokens and are idempotent. `llm` nodes run `claude -p` in a container (podman or docker). The gate is an `llm` node with the person as answerer, before the run.
 - State lives in files under `~/.heideng/<project>/`.
-- A local UI follows the run and shows its result. It does not write run data; actions go only through `control.jsonl`.
+- A local UI shows the run's state and result. It does not write run data; actions go only through `control.jsonl`.
 
 ### Graph
 
@@ -133,9 +133,9 @@ Fix tickets (from verify and regression) and review tickets enter the queue of t
 |---|---|---|---|---|
 | gate | spec, `contract.md`, `acceptance.md` of active specs | gaps and proposals, `acceptance.md`, superseded ACs | - | worker |
 | holdout-gen | spec, `contract.md`, `acceptance.md`, active holdout | `verify` skill, scenarios, replays | `create-` / `maintain-verification-skill-from-spec` | worker |
-| holdout oracle | scenarios, replays, `acceptance.md` | `{ ok, issues[] }` | - | judge |
+| holdout oracle | scenarios, replays, `acceptance.md` | `{ ok, issues[], fixed }` | - | judge |
 | tickets | spec, `contract.md`, `acceptance.md`, clone of the integration branch (writes only in `.scratch/`) | ticket files in `.scratch/<slug>/issues/` | `to-tickets` ([mattpocock/skills](https://github.com/mattpocock/skills)) | worker |
-| ticket oracle | `to-tickets` questions and quiz, spec, `contract.md`, `acceptance.md`, `decisions.md`, read-only repo | `{ ok, issues[], answers[] }` | - | judge |
+| ticket oracle | `to-tickets` questions and quiz, spec, `contract.md`, `acceptance.md`, `decisions.md`, read-only repo | `{ ok, issues[], answers[], fixed }` | - | judge |
 | implement | its own clone read-write, dependency cache; in the prompt ticket, spec, `contract.md`, `acceptance.md`, `decisions.md` | `{ status: done\|blocked\|needs_input, questions[], summary, decisions[], skipped[] }` | `tdd`, `diagnosing-bugs` (mattpocock/skills); `verification-before-completion` ([obra/superpowers](https://github.com/obra/superpowers)) | worker |
 | review | read-only clone of the integration branch, round diff, spec, `acceptance.md` | `{ notes[] }` | `code-review` (mattpocock/skills); `ponytail-review` ([DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail)) | judge |
 | verify | read-only holdout, app URL, `heideng-exec` to the app container | verdicts per scenario | `verify` (generated); driver [playwright-cli](https://github.com/microsoft/playwright-cli) | judge |
@@ -187,7 +187,7 @@ The gate is the only step of a spec where a person takes part. The node uses the
 
 `heideng run` rejects a spec without a lock, with a lock that differs from the files on the branch, with a `heideng/<slug>` branch that does not start from `main`, with `heideng/<slug>` checked out in the project repo, or with a run of the same spec already merged on the current `spec.lock`. `heideng resume` rejects `heideng/<slug>` checked out in the project repo. Every rejection happens before any node runs.
 
-A `heideng accept` with an open run on the same spec adds a commit on the branch and increments the lock version; the report states the round in which the lock changed. The open run keeps its tickets and the spec's saved plan is discarded.
+A `heideng accept` with an open run on the same spec adds a commit on the branch and increments the lock version; the report states the round in which the lock changed. The open run keeps its tickets and the engine discards the spec's saved plan.
 
 A `heideng accept` with no open run on the spec:
 - last run of the spec not merged (failed, aborted, closed): starts from the existing `heideng/<slug>`, keeps its commits and increments the lock version. The plan of the previous version is no longer valid, so the next run plans again on top of the code on the branch;
@@ -394,7 +394,7 @@ The engine writes from templates, at zero tokens:
 | 4 Check | tool | Every scenario has a verdict, every verdict has evidence at the declared path and is consistent with the replay exit code |
 
 The replay exit code is a ceiling for the judge:
-- red replay: the agent chooses among `fail_product`, `fail_contract`, `harness_gap`, `unknown`; a `pass` is rewritten to `fail_product` and noted in the report. `harness_gap` requires evidence from step 1 (start or doctor), otherwise it becomes `unknown`;
+- red replay: the agent chooses among `fail_product`, `fail_contract`, `harness_gap`, `unknown`; the engine rewrites a `pass` to `fail_product` and notes it in the report. `harness_gap` requires evidence from step 1 (start or doctor), otherwise it becomes `unknown`;
 - green replay: the agent can lower to fail with evidence, never raise;
 - scenario without replay: the verdict is the agent's.
 
@@ -413,7 +413,7 @@ The engine reruns a red replay once on clean state. Two reds count as a fail. Re
 | `harness_gap` | holdout-gen repairs with `maintain-...-from-spec`, then reruns | nothing |
 | `unknown` | counts as failure | scenario id |
 
-Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions, Drive helpers). A failing start or seed is a contract or product defect, not a skill defect.
+Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions, Drive helpers). A failing start or seed is a contract or product defect.
 
 ### Baseline and regression (tool)
 
@@ -472,7 +472,7 @@ Every non-empty `source` must appear verbatim in spec, `contract.md`, `acceptanc
 
 ### Stop
 
-A stop is an exception: it happens when the work stops progressing, not after a fixed number of passes.
+A loop stops when its work stops progressing.
 
 - A loop continues while its passes make progress and stops with an escalation after `patience` consecutive passes without progress.
 - A safety cap of `max_passes` passes per loop, configurable and high by default, ends a loop that keeps changing without converging.
@@ -483,7 +483,7 @@ A stop is an exception: it happens when the work stops progressing, not after a 
 | Run (rounds) | holdout and regression green | the set of failed or `unknown` scenarios changes |
 | Ticket (visits) | green tests + merge | the red tests change or decrease |
 | llm node session | valid output against the schema | the session changed files or output since the previous pass |
-| Holdout oracle, ticket oracle | `ok: true` | at least one issue of the previous judgment is fixed |
+| Holdout oracle, ticket oracle | `ok: true` | `fixed` >= 1: the oracle reports how many issues of the previous judgment are fixed |
 | Holdout tool check, graph-check | all checks pass | the set of check errors changes |
 | Questions | `status` other than `needs_input` | the node asks no question it already had answered |
 | Harness | `harness_gap` repaired | the repaired scenario does not return `harness_gap` |
@@ -591,7 +591,7 @@ The engine has a TypeScript schema for each version. The server converts old run
 - `container.runtime: podman | docker`, defaulting to the one installed. The engine uses only commands common to both (`run`, `network`, `volume`, `build`).
 - The mounts of each node are in the "Sees" column of [llm nodes](#llm-nodes).
 - The app under test runs in a dedicated container on an internal network, reachable by verify.
-- Credentials reach containers through env or a copy in tmpfs.
+- The engine passes credentials to containers through env or a copy in tmpfs.
 - Every container runs as the host user (`--user <uid>:<gid>`, with podman `--userns keep-id`) and with `--cap-drop ALL`, so files written on the mounts belong to the person. `HOME` points to a writable path, because that uid has no home in the image. Volumes the containers write to (dependency cache) are writable by that user from their first use.
 - Image builds run as root inside the build and use none of these options.
 
@@ -1017,7 +1017,7 @@ heideng state:
 
 ## Testability
 
-heideng is verified through its binary with `claude` replaced by a stub. Three seams, read from env and absent from `--help` and README:
+Tests drive the heideng binary with a stub in place of `claude`. Three seams, read from env and absent from `--help` and README:
 
 | Variable | Replaces | Containers | What it proves |
 |---|---|---|---|
@@ -1026,5 +1026,5 @@ heideng is verified through its binary with `claude` replaced by a stub. Three s
 | `HEIDENG_CLAUDE_STUB_DIR` | only `claude` inside the containers: the dir is mounted at `/heideng-stub` and `/heideng-stub/claude` is the command, with `HEIDENG_NODE` and `HEIDENG_EXEC` in the env | real podman/docker | images, egress proxy and internal network, secrets, mounts, user and permissions, sessions across containers |
 
 - `HEIDENG_CLAUDE_BIN` wins when both claude seams are set. A `HEIDENG_CLAUDE_STUB_DIR` without an executable `claude` rejects `accept` and `run` with exit code 5.
-- Container behavior (build behind the proxy, `--internal` network, non-root mounts, cache volume, session persistence) is proven only with `HEIDENG_CLAUDE_STUB_DIR` on a real runtime; the other seams never execute it.
+- Only `HEIDENG_CLAUDE_STUB_DIR` on a real runtime proves container behavior (build behind the proxy, `--internal` network, non-root mounts, cache volume, session persistence); the other seams never execute it.
 - The stubs reproduce the Claude Code behaviors the engine depends on: a new `session_id` per call stored under `CLAUDE_CONFIG_DIR`, `--resume` of an unknown session fails with `No conversation found with session ID`, the `result` message with `structured_output`, cost and errors. A stub that accepts any `--resume` hides the loss of sessions between containers.
