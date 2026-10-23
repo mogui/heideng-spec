@@ -288,7 +288,7 @@ Body of the to-tickets file: What to build, Blocked by, acceptance criteria.
    - every ticket has a `**Covers:** AC-1, AC-2` line with the ids from `acceptance.md` (`**Covers:** AC-0` for the bootstrap);
    - the quiz shows the Covers line and the acceptance criteria for each ticket;
    - the clone may already contain part of the work: the breakdown covers only what the spec still requires on top of the existing code;
-   - without `.heideng/Dockerfile` in the repo, `01` is the bootstrap and every other ticket depends on `01`. The bootstrap contains only stack, `.heideng/Dockerfile`, `.heideng/test`, `.heideng/build`, `.heideng/start`, a runnable skeleton and a smoke test; domain foundations (models, identity, base pages) are tickets of their own.
+   - without `.heideng/Dockerfile` in the repo, `01` is the bootstrap and every other ticket depends on `01`. The bootstrap contains only stack, `.heideng/Dockerfile`, `.heideng/test`, `.heideng/build`, `.heideng/start`, a runnable skeleton and a smoke test. The three scripts are POSIX `sh` with `#!/bin/sh`, because the project image's `/bin/sh` can be dash. Domain foundations (models, identity, base pages) are tickets of their own.
 3. The skill's questions, quiz included, go to the ticket oracle.
 4. The engine converts the files: `id` = `T-<NN>` from the file number; `deps` from the tickets cited in "Blocked by"; `ac` from the Covers line; body unchanged.
 5. Graph-check.
@@ -360,6 +360,7 @@ The engine writes from templates, at zero tokens:
 
 - New container, same image and same clone; runs `project.test`, or `.heideng/test` if not set. Only the exit code the engine observes counts.
 - With `project.test` set, the bootstrap and implement prompts state the command used and that `.heideng/test` is not run. The same holds for `project.build` and `project.start`.
+- Every node runs a `.heideng/` script the same way (test, wave-test, merge-test, verify build and start): executable through its shebang, otherwise with `sh`. Implement, test and verify then see the same outcome.
 - If red, the engine increments `visit` and relaunches implement on the same clone, with the compressed output in the prompt. After `patience` visits without progress the ticket becomes `failed` and its dependents stay blocked; the run continues and verify reports the scenarios the ticket left failing.
 - Compression, at zero tokens: only failed tests with message and stack trace, repeated lines collapsed; if the format is not recognized, the tail of the output. The full output stays in `nodes/<exec>/`.
 - Every tool node that runs project code (test, build, wave-test, replay, getting started) has a timeout of 20 minutes; when it expires the outcome is red with the note "timeout".
@@ -389,7 +390,7 @@ The engine writes from templates, at zero tokens:
 | Step | Type | What |
 |---|---|---|
 | 1 Start | tool | Build from the integration branch, app container on the internal network, wait for the ready signal, seed (endpoint called by the engine or command run in the app container); all from the Run section of the contract. Baseline and regression use the same code |
-| 2 Replay | tool | Runs the replays, each on clean state (app container restart and seed); the outcome is the exit code; collects traces and screenshots |
+| 2 Replay | tool | Runs the replays, each on clean state (app container restart and seed); the outcome is the exit code; collects traces and screenshots. Playwright runs from the replay's directory, the same one as the `--list` check: with no config it finds only tests under its cwd |
 | 3 Agent | llm | `verify` skill: drives the scenarios without a replay, one per clean state, assesses non-binary evidence, classifies failures |
 | 4 Check | tool | Every scenario has a verdict, every verdict has evidence at the declared path and is consistent with the replay exit code |
 
@@ -413,7 +414,7 @@ The engine reruns a red replay once on clean state. Two reds count as a fail. Re
 | `harness_gap` | holdout-gen repairs with `maintain-...-from-spec`, then reruns | nothing |
 | `unknown` | counts as failure | scenario id |
 
-Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions, Drive helpers). A failing start or seed is a contract or product defect.
+Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions, Drive helpers). A failing start or seed is a contract or product defect. Its fix ticket carries the command the engine ran and the tail of the build, start or seed log, so implement reproduces the failure the way verify ran it.
 
 ### Baseline and regression (tool)
 
@@ -480,7 +481,7 @@ A loop stops when its work stops progressing.
 
 | Loop | `loop` | Success stop | Progress |
 |---|---|---|---|
-| Run (rounds) | `rounds` | holdout and regression green | the set of failed or `unknown` scenarios changes |
+| Run (rounds) | `rounds` | holdout and regression green | the set of failed or `unknown` scenarios changes (for regression, the set of red replays); with none failing, fewer tickets stay queued |
 | Ticket (visits) | `visits` | green tests + merge | the red tests change or decrease |
 | llm node session | `holdout-gen`, `tickets` | valid output against the schema | the session changed files or output since the previous pass |
 | Holdout oracle, ticket oracle | `holdout-oracle`, `ticket-oracle` | `ok: true` | `fixed` >= 1: the oracle reports how many issues of the previous judgment are fixed |
@@ -512,7 +513,7 @@ The `stop` event of a loop has kind `no_progress` or `max_passes` and the `loop`
 - Every escalation produces a `stop` event (`level: run`) and stops the run as described under [Graph](#graph); `heideng resolve` closes them and `heideng resume` restarts from the next round.
 - `heideng status` lists the open escalations of all the project's runs.
 - Ways to close:
-  - missing decision: `heideng resolve <id> "note"` writes the note to `decisions.md`, requeues the ticket and resets the `patience` count of the rounds; then `heideng resume` on the same run;
+  - missing decision: `heideng resolve <id> "note"` writes the note to `decisions.md`, requeues the ticket, restarts its visits and resets the `patience` count of the rounds; then `heideng resume` on the same run;
   - spec or contract gap: edit, new `heideng accept` on the same open run (new `spec.lock` version, holdout updated with `maintain-...-from-spec`), then `heideng resume`, which opens a new round. Tickets already merged stay; modified ACs produce fix tickets from verify.
 - `heideng resume` with no flag gives the limit that stopped the run a new allowance equal to its configured value: passes for a loop, `usd_per_run` for cost, `wall_clock` for time. `--add-usd 20`, `--add-passes 2` (raises `max_passes` of the stopped loop), `--add-time 2h` set a precise amount.
 - Extensions and resolutions produce `control` events and appear in the report.
@@ -607,7 +608,7 @@ The engine has a TypeScript schema for each version. The server converts old run
 - With docker the engine builds with the classic builder, because BuildKit rejects `--network` to a user network and every build goes through the egress proxy. Podman accepts it.
 - `.heideng/Dockerfile` is a repo file, and agents create and modify it like any other file.
 - `<hash>` covers `.heideng/Dockerfile` and the lockfiles. The engine rebuilds at the wave boundary when the hash changes.
-- Bootstrap: with a repo without `.heideng/Dockerfile`, `T-01` runs alone in the first wave, in `heideng-base`, and creates stack, `.heideng/*` and skeleton. After the merge the engine builds the image. If the spec fixes the stack, the bootstrap respects it; otherwise the choice is a question to the answerer and goes to `decisions.md` as `uncovered`.
+- Bootstrap: with a repo without `.heideng/Dockerfile`, `T-01` runs alone in the first wave, in `heideng-base`, and creates stack, `.heideng/*` and skeleton. Before its tests the engine checks that `.heideng/Dockerfile` starts `FROM heideng-base`; otherwise the visit is red with the reason. After the merge the engine builds the image. If the spec fixes the stack, the bootstrap respects it; otherwise the choice is a question to the answerer and goes to `decisions.md` as `uncovered`.
 
 ### Egress
 
