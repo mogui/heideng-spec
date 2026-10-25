@@ -46,6 +46,9 @@ Heideng (黑灯工厂, hēidēng gōngchǎng, "lights-out factory") is a CLI tha
 | Oracle | LLM judge. The holdout oracle assesses the scenarios, the ticket oracle assesses the ticket breakdown |
 | Uncovered | Answer or decision that spec and contract do not settle. The run uses a default and reports it |
 | Escalation | Problem the run cannot solve on its own and hands to the person |
+| Surface | A way the engine reaches the product (`http`, `browser`, `exec`, `files`, `desktop`), declared in the Run section; each scenario drives one |
+| Harness contract | `~/.heideng/harness.md`: how the engine builds, starts, reaches and observes the product, written by heideng |
+| Harness failure | A verify round or wave-test red for the harness, not the product: `AC-0` red or one runtime error class on every red replay or test. One escalation, no fix tickets |
 | `exec` | Deterministic key of a node execution. Inside rounds `r<n>/w<n>/<node>/<ticket>/v<n>` (`r2/w1/implement/F-1/v2`), `r<n>/review`, `r<n>/verify`; outside `gate/v<n>`, `holdout-gen/v<n>` (each oracle pass or harness repair increments `v`), `baseline`, `tickets/v<n>`, `regression/v<n>`, `docs`, `merge-main`, `report`. Names the `nodes/<exec>/` folder and is the idempotency key |
 | `attempt` | Execution number of the same `exec` after a resume |
 
@@ -60,8 +63,14 @@ Heideng (黑灯工厂, hēidēng gōngchǎng, "lights-out factory") is a CLI tha
 
 ```mermaid
 flowchart TD
-    gate[/"heideng accept (person, before the run)"/] -->|branch heideng/slug: spec, acceptance, contract, lock| hgen[holdout-gen]
-    hgen --> hcheck{tool check + holdout oracle}
+    init[/"heideng init / upgrade"/] -.->|"writes harness.md: surfaces, build-and-run rules, Run grammar, verify rules, evidence paths"| harness[("harness.md")]
+    harness -.-> gate
+    gate[/"heideng accept (person, before the run)"/] --> gparse{"Run section parses?"}
+    gparse -->|"no, or spec contradicts a build-and-run rule: gate proposes the harness line"| gate
+    gparse -->|ok| gdec["open product choices, confirmed by the person: decisions.md with source gate"]
+    gdec -->|"branch heideng/slug: spec, acceptance with AC-0, contract, decisions, lock"| ld
+    ld["engine fills Launch + Doctor from harness.md and Run section"] --> hgen["holdout-gen: Drive, Evidence, Cleanup, features, scenarios, replays, s00-* from templates"]
+    hgen --> hcheck{"tool check + holdout oracle"}
     hcheck -->|issues| hgen
     hcheck -->|ok| baseline[baseline]
     baseline --> tickets[tickets]
@@ -72,40 +81,65 @@ flowchart TD
 
     subgraph ROUND
         queue[(ticket queue)]
+        subgraph BOOTSTRAP ["wave 1: T-01 bootstrap"]
+            bimpl["implement T-01 in heideng-base"] --> btest{test}
+            btest -->|"red, visit++"| bimpl
+            btest -->|green| bfrom{"Dockerfile FROM heideng-base?"}
+            bfrom -->|"no: visit red"| bimpl
+            bfrom -->|ok| smoke{"AC-0 smoke: build, start, ready, seed, s00-* per surface"}
+            smoke -->|"red: visit++ with runtime error and log tail"| bimpl
+            smoke -->|green| bmerge{merge}
+        end
         subgraph WAVE
             clone[clone] --> impl[implement x parallel]
             impl --> test{test}
-            test -->|red, visit++| impl
+            test -->|"red, visit++"| impl
             test -->|green| merge{merge}
-            merge -->|ok| wtest{wave-test}
+            merge -->|ok| wsmoke{"AC-0 replays"}
+            wsmoke -->|green| wtest{wave-test}
         end
         queue --> clone
-        merge -->|conflict, visit++| queue
-        wtest -->|red: bisect, culprit visit++| queue
-        wtest -->|tickets ready: new wave| queue
-        wtest -->|queue empty or all blocked| review[review]
-        review -->|blocking notes: review tickets| queue
-        review --> verify{verify}
-        verify -->|harness_gap: repair verify/| verify
-        verify -->|fail_*, unknown: fix tickets| queue
-        verify --> ledger[ledger]
+        queue -->|"first wave, no .heideng/Dockerfile"| bimpl
+        bmerge --> wtest
+        merge -->|"conflict, visit++"| queue
+        wsmoke -->|"red: harness failure"| hesc
+        wtest -->|"red, assertion errors: bisect, culprit visit++"| queue
+        wtest -->|"red, one runtime error class on every red test: harness failure"| hesc
+        wtest -->|"tickets ready: new wave"| queue
+        wtest -->|"queue empty or all blocked"| review[review]
+        impl -.->|"empty diff and same red tests for patience visits: escalation with wave-test log"| hesc
+        review -->|"blocking notes: review tickets"| queue
+        review --> vsmoke{"verify 0: AC-0 replays"}
+        vsmoke -->|"red: harness failure"| hesc
+        vsmoke -->|green| vrun["verify 1-2: start, replays"]
+        vrun --> vdoctor{"verify 3a: Doctor, one check per surface"}
+        vdoctor -->|"red: harness_gap for every scenario, agent stops"| repair["holdout-gen repairs Drive helpers and features; engine regenerates Launch + Doctor"]
+        repair --> vsmoke
+        vdoctor -->|green| vagent["verify 3b: agent drives scenarios without replay"]
+        vagent --> vcheck{"verify 4: check"}
+        vcheck -->|"every red replay shares one runtime error class: harness failure"| hesc
+        vcheck -->|"fail_*, unknown: fix tickets with scenario intent and first runtime error"| queue
+        vcheck --> ledger[ledger]
         ledger --> route{route}
-        route -->|tickets in queue: new round| queue
+        route -->|"tickets in queue: new round"| queue
     end
 
-    route -->|verify green, queue empty| regr{regression}
-    route -->|budget stop or open escalation| report
-    regr -->|red: fix tickets, new round| queue
+    hesc["escalation harness: error class, first runtime error, doctor.md, build and start logs, matching harness rule"] --> report
+    route -->|"verify green, queue empty"| regr{regression}
+    route -->|"budget stop or open escalation"| report
+    regr -->|"red: fix tickets, new round"| queue
     regr -->|green| docs[docs]
     docs --> mmain{merge main}
-    mmain -->|red or conflict: escalation| report
+    mmain -->|"red or conflict: escalation"| report
     mmain -->|merged| report[report]
 ```
 
 | Node | Type | What |
 |---|---|---|
-| gate | llm | `heideng accept`: completes the spec, extracts the ACs, writes `spec.lock`; answerer: the person in the terminal |
-| holdout-gen | llm | `verify` skill, scenarios and replays from spec and contract; then tool check and holdout oracle |
+| harness.md | engine file | [harness contract](#harness-contract): surfaces, build-and-run rules, Run section grammar, verify and evidence rules; read by gate, holdout-gen, implement, tickets, verify, responder |
+| gate | llm | `heideng accept`: completes the spec against the harness contract, asks the open product choices, extracts the ACs, writes `spec.lock`; answerer: the person in the terminal; the engine parses the Run section before the commit |
+| Launch + Doctor | tool | engine text in the `verify` skill, from `harness.md` and the Run section |
+| holdout-gen | llm | `verify` skill (Drive, Evidence, Cleanup, features), scenarios and replays from spec and contract, `s00-*` from templates; then tool check and holdout oracle |
 | baseline | tool | replays of previous specs on `main`; excludes red ones from regression and notes them |
 | tickets | llm | `/to-tickets`; questions and quiz go to the ticket oracle |
 | graph-check | tool | graph, AC coverage, bootstrap, conformance to the approved quiz |
@@ -113,9 +147,11 @@ flowchart TD
 | implement | llm | in parallel, one container per ticket |
 | test | tool | `.heideng/test` in the clone, real exit code |
 | merge | tool | sequential `--no-ff`; a conflict puts the ticket back in the queue |
-| wave-test | tool | tests once at the end of the wave; bisect if red |
+| AC-0 smoke | tool | verify steps 1 and 2 on the `s00-*` replays; in the bootstrap visit, before every wave-test and as verify step 0 |
+| wave-test | tool | tests once at the end of the wave; bisect if red with assertion errors; harness failure if every red test shares one runtime error class |
 | review | llm | `code-review`, then `ponytail-review`; blocking notes become tickets |
-| verify | tool + llm | replays, verify agent, evidence check |
+| verify | tool + llm | smoke, replays, Doctor, verify agent, evidence check |
+| harness failure | tool | one escalation `harness`, `harness_gap` for every scenario, no fix tickets, no bisect, round ignored by `patience` |
 | ledger | tool | ticket status, decisions, costs |
 | route | tool | chooses between new round, regression and stop |
 | regression | tool | replays of active specs, minus the ones red in baseline |
@@ -131,16 +167,16 @@ Fix tickets (from verify and regression) and review tickets enter the queue of t
 
 | Node | Sees | Output | Skill | Role |
 |---|---|---|---|---|
-| gate | spec, `contract.md`, `acceptance.md` of active specs | gaps and proposals, `acceptance.md`, superseded ACs | - | worker |
-| holdout-gen | spec, `contract.md`, `acceptance.md`, active holdout | `verify` skill, scenarios, replays | `create-` / `maintain-verification-skill-from-spec` | worker |
+| gate | spec, `contract.md`, `acceptance.md` of active specs, `harness.md` | gaps and proposals, open product choices, `acceptance.md`, superseded ACs | - | worker |
+| holdout-gen | spec, `contract.md`, `acceptance.md`, active holdout, `harness.md` | `verify` skill (Drive, Evidence, Cleanup, features), scenarios, replays | `create-` / `maintain-verification-skill-from-spec` | worker |
 | holdout oracle | scenarios, replays, `acceptance.md` | `{ ok, issues[], fixed }` | - | judge |
 | tickets | spec, `contract.md`, `acceptance.md`, clone of the integration branch (writes only in `.scratch/`) | ticket files in `.scratch/<slug>/issues/` | `to-tickets` ([mattpocock/skills](https://github.com/mattpocock/skills)) | worker |
 | ticket oracle | `to-tickets` questions and quiz, spec, `contract.md`, `acceptance.md`, `decisions.md`, read-only repo | `{ ok, issues[], answers[], fixed }` | - | judge |
-| implement | its own clone read-write, dependency cache; in the prompt ticket, spec, `contract.md`, `acceptance.md`, `decisions.md` | `{ status: done\|blocked\|needs_input, questions[], summary, decisions[], skipped[] }` | `tdd`, `diagnosing-bugs` (mattpocock/skills); `verification-before-completion` ([obra/superpowers](https://github.com/obra/superpowers)) | worker |
+| implement | its own clone read-write, dependency cache; in the prompt ticket, spec, `contract.md`, `acceptance.md`, `decisions.md`, build-and-run rules of `harness.md` | `{ status: done\|blocked\|needs_input, questions[], summary, decisions[], skipped[] }` | `tdd`, `diagnosing-bugs` (mattpocock/skills); `verification-before-completion` ([obra/superpowers](https://github.com/obra/superpowers)) | worker |
 | review | read-only clone of the integration branch, round diff, spec, `acceptance.md` | `{ notes[] }` | `code-review` (mattpocock/skills); `ponytail-review` ([DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail)) | judge |
-| verify | read-only holdout, app URL, `heideng-exec` to the app container | verdicts per scenario | `verify` (generated); driver [playwright-cli](https://github.com/microsoft/playwright-cli) | judge |
+| verify | read-only holdout, app URL, `heideng-exec` to the product container, verify rules of `harness.md` | verdicts per scenario | `verify` (generated); driver [playwright-cli](https://github.com/microsoft/playwright-cli) | judge |
 | docs | spec, `contract.md`, `acceptance.md`, `decisions.md` of the run and of active specs, diff `main...heideng/<slug>`, clone of the integration branch (writes only `README.md` and `docs/**`) | `{ status, summary, files[], getting_started_runnable }` | - | worker |
-| responder | spec, `contract.md`, `acceptance.md`, `decisions.md` of the run and of active specs, questions; read-only repo, except for holdout-gen questions | `{ answers[] }` | - | answerer |
+| responder | spec, `contract.md`, `acceptance.md`, `decisions.md` of the run and of active specs, `harness.md`, questions; read-only repo, except for holdout-gen questions | `{ answers[] }` | - | answerer |
 
 Only holdout-gen and verify mount the holdout. The `T-01` bootstrap is an implement that runs in `heideng-base`.
 
@@ -161,7 +197,7 @@ The spec comes from a writing process outside heideng, in free form. The gate ch
 | Level | Where it lives | Who writes it | Example |
 |---|---|---|---|
 | AC | `acceptance.md` | gate, confirmed by the person | `AC-4`: an expired share link does not open the note |
-| AC-0 | `acceptance.md` | gate, from template | `AC-0`: the Run section of the contract works: start, ready signal, seed, Drive reachable |
+| AC-0 | `acceptance.md` | gate, from template | `AC-0`: the Run section of the contract works through every declared surface: build, start, ready signal, seed, one trivial drive per surface |
 | Scenario | `holdout/scenarios/<spec>/` | holdout-gen | `notes-03`: create a share, let it expire, open `/s/:token`, expect 410 and note not visible |
 | Replay | `holdout/replays/<spec>/` | holdout-gen | `notes-03.spec.ts` |
 
@@ -169,21 +205,36 @@ The spec comes from a writing process outside heideng, in free form. The gate ch
 
 `contract.md` lives in the repo and is cumulative. Each spec changes only the parts it touches. The delta enters `main` only with the run's merge, so `main` always describes existing software.
 
-- **Run.** Port, ready signal (e.g. `GET /health`), env variable names (values live outside the repo, see [App secrets](#app-secrets)), seed (endpoint or command). The start command lives in the project image (`CMD` or `.heideng/start`), so Run stays stack-independent.
+- **Run.** Surfaces, port, ready signal, env variable names (values live outside the repo, see [App secrets](#app-secrets)), seed. One line per value, in the grammar of the [harness contract](#harness-contract); the engine parses only these lines. The start command lives in `.heideng/start`, so Run stays stack-independent.
 - **Drive.** Routes, commands, endpoints. For UIs: labels, roles, visible text and mandatory `data-testid`. If a scenario depends on time (expirations, cron), Drive declares the time control (endpoint or env variable); without it, the scenario is `fail_contract`.
 - **Observe.** Expected evidence: output, files, DB rows, side effects.
 
-For web apps replays use user-facing Playwright locators (`getByRole`, `getByLabel`, `getByText`, `getByTestId`) written from the contract without seeing the UI; Playwright's auto-wait handles waiting. If a locator does not find the element the verdict is `fail_contract`. The scenario stays unchanged and implement adapts the code to the contract.
+#### Surfaces
+
+A surface is a way the engine reaches the product. The Run section declares the product's surfaces; every scenario drives exactly one. heideng fixes the list, the driver of each, where its replays run and what evidence they leave.
+
+| Surface | Product | Driver, from `heideng-verify` | Replay runs in | Target | Evidence |
+|---|---|---|---|---|---|
+| `http` | API, service with an HTTP port | `curl`, Playwright request context | `heideng-verify` | `APP_URL=http://heideng-app:<port>` | request and response logs |
+| `browser` | web UI | headless playwright-cli, contract locators | `heideng-verify` | `APP_URL=http://heideng-app:<port>` | traces, screenshots, accessibility snapshots |
+| `exec` | CLI, library through its test suite, daemon through its control commands | `heideng-exec`: a command in the product container, from the project directory | product container, `sh` | the project directory; `APP_URL=http://localhost:<port>` when the product also has a port | stdout, stderr, exit code, files the scenario names |
+| `files` | anything that writes files, queues, sockets | `heideng-exec` reading paths | product container | paths from the Observe section | file contents |
+| `desktop` | GUI app | playwright-cli on the product's web view, or the automation surface named in Drive | `heideng-verify` or product container | from Drive | screenshots, traces |
+
+A product with no long-running process (CLI, library) has only `exec` and `files`: its Run section has no port and `Ready: none`. Ready and reachable then mean that the product container runs `.heideng/test` with exit 0 and one command of the Drive section with the exit code the contract gives. A GUI with neither a web view nor an automation surface is a gap the gate blocks.
+
+For the `browser` surface replays use user-facing Playwright locators (`getByRole`, `getByLabel`, `getByText`, `getByTestId`) written from the contract without seeing the UI; Playwright's auto-wait handles waiting. If a locator does not find the element the verdict is `fail_contract`. The scenario stays unchanged and implement adapts the code to the contract.
 
 ### Gate: `heideng accept <spec>`
 
 The gate is the only step of a spec where a person takes part. The node uses the same mechanism as the other llm nodes (see [Questions and answerers](#questions-and-answerers)). On `needs_input` heideng shows proposals and questions in a TUI (see [`accept`](#accept)), collects the person's answers and resumes the session with `--resume`.
 
-1. Checks the spec with the Run / Drive / Observe checklist: verifiable behaviors, contract delta for each section.
+1. Checks the spec with the Run / Drive / Observe checklist: verifiable behaviors, contract delta for each section. The gate reads the [harness contract](#harness-contract): the Run section follows its grammar and its build-and-run rules. A spec line that contradicts a rule (a bind on `127.0.0.1` or `localhost`, a start through `CMD`, a GUI with no automation surface) is a gap; the gate proposes the harness line as the correction, with the harness contract as source.
 2. For each gap it proposes an addition; the person confirms or corrects.
-3. Extracts the ACs with stable ids into `acceptance.md`. On the project's first spec it adds `AC-0` from template.
-4. Compares with the ACs of active specs and lists the superseded ones (`spec-A/AC-3` modified or removed).
-5. On confirmation it creates the `heideng/<slug>` branch from `main` and commits to it the completed spec in `.heideng/specs/<slug>/spec.md`, `acceptance.md`, the delta applied to `contract.md` and `.heideng/specs/<slug>/spec.lock`: version, hashes of `spec.md`, `acceptance.md` and `contract.md`, plus the list of superseded ACs.
+3. Lists the product choices the spec leaves open and that every ticket would otherwise decide alone: language and runtime version, dependency policy, normalization of stored input (trim, case), output formats (line endings, number and date formats, exit codes), ordering tie-breaks, error precedence. It proposes one answer per choice; the person confirms or corrects in the same TUI. The answers go to `.heideng/specs/<slug>/decisions.md` with source `gate` and are documents for the responder and the citation check from the first ticket. `uncovered` in the report lists only choices the gate did not ask.
+4. Extracts the ACs with stable ids into `acceptance.md`. On the project's first spec it adds `AC-0` from template.
+5. Compares with the ACs of active specs and lists the superseded ones (`spec-A/AC-3` modified or removed).
+6. On confirmation the engine parses the Run section against the grammar; a Run section that does not parse is a gate `error` with the offending lines, and the gate proposes again. Then it creates the `heideng/<slug>` branch from `main` and commits to it the completed spec in `.heideng/specs/<slug>/spec.md`, `acceptance.md`, `decisions.md`, the delta applied to `contract.md` and `.heideng/specs/<slug>/spec.lock`: version, hashes of `spec.md`, `acceptance.md` and `contract.md`, plus the list of superseded ACs.
 
 `heideng run` rejects a spec without a lock, with a lock that differs from the files on the branch, with a `heideng/<slug>` branch that does not start from `main`, with `heideng/<slug>` checked out in the project repo, or with a run of the same spec already merged on the current `spec.lock`. `heideng resume` rejects `heideng/<slug>` checked out in the project repo. Every rejection happens before any node runs.
 
@@ -202,31 +253,33 @@ holdout-gen generates the holdout from spec, contract and `acceptance.md`, in a 
 ```
 ~/.heideng/<project>/holdout/
   verify/                 skill: SKILL.md (Launch, Doctor, Drive, Evidence, Cleanup) + features/*.md
-                          Launch and Doctor describe how the engine starts the app (URL, seed users); they contain no start commands
+                          Launch and Doctor are engine text, filled from the harness contract and the Run section:
+                          target per surface, seed, one Doctor check per declared surface; they contain no start commands
   scenarios/<spec>/*.md   intent + assertions, each scenario with AC-id      (hash)
   replays/<spec>/*        Playwright / script, one per scenario where possible (hash)
+                          s00-*: the AC-0 replays, from the engine's templates per surface
   retired/<spec>/         retired scenarios and replays, with the reason
 ```
 
 ### Generation
 
+- The engine writes Launch and Doctor before holdout-gen runs and rewrites them at every run start; holdout-gen writes Drive, Evidence, Cleanup, features, scenarios and replays. The holdout-gen prompt carries the harness contract.
 - `create-verification-skill-from-spec` on the project's first spec: creates `verify` skill, scenarios and replays.
 - `maintain-verification-skill-from-spec` on later specs: works on the contract delta and on the superseded ACs listed in `spec.lock`.
   - Modified AC: rewrites scenario and replay, with a new hash.
   - Removed AC: moves scenario and replay to `retired/<spec>/` with the reason.
-- Drivers fixed by heideng, installed in `heideng-verify`, declared in the holdout-gen prompt and used by the Drive section of the `verify` skill:
-  - web app: headless playwright-cli, with accessibility snapshots, contract locators, traces and screenshots as evidence. The official playwright-cli skill is in the image, so the `verify` skill names drivers and scenarios and omits commands;
-  - API: `curl` on the internal network;
-  - CLI: the commands of the Drive section, run in the app container through `heideng-exec` (helper in `heideng-verify`), both by replays and by the agent.
-- The spec is the source of truth, so a difference between app and `verify` skill is a product defect. During a run the skill changes only to repair a `harness_gap`.
+- `AC-0` replays come from the engine's templates, on the project's first spec: `s00-test` (the project's test command, or `.heideng/test`, exits 0 in the product container, every product), `s00-ready` (the Ready target from `heideng-verify` when it is HTTP, in the product container when it is a command), `s00-http` (a `GET /` from `heideng-verify` when the surface is `http` and Ready is a command), `s00-browser` (a page load with a visible body). Later specs run the first spec's smoke. holdout-gen leaves these files as they are.
+- Drivers fixed by heideng, installed in `heideng-verify`, declared in the holdout-gen prompt and used by the Drive section of the `verify` skill: one per [surface](#surfaces). The official playwright-cli skill is in the image, so the `verify` skill names drivers and scenarios and omits commands. `heideng-exec` (helper in `heideng-verify`) runs the commands of the `exec` and `files` surfaces in the product container, both for replays and for the agent.
+- The spec is the source of truth, so a difference between product and `verify` skill is a product defect. During a run the skill changes only to repair a `harness_gap`, and the repair touches only Drive helpers and features.
 
 ### Checks after generation
 
 - Tool:
   - traceability: every AC has at least one scenario and every scenario cites existing ACs;
   - parsing: replay typecheck, `playwright test --list`;
-  - skill: frontmatter and sections present.
-- Holdout oracle: AC coverage and non-trivial assertions. This check catches empty or trivial scenarios. With `maintain` it judges the scenarios and replays of the added and modified ACs plus AC coverage of the whole `acceptance.md`; scenarios of unchanged ACs keep the verdict they already have.
+  - skill: frontmatter and sections present, Launch and Doctor equal to the engine's text;
+  - `AC-0`: every `s00-*` replay of the declared surfaces present.
+- Holdout oracle: AC coverage and non-trivial assertions, on Drive, scenarios and replays; Launch, Doctor and the `s00-*` replays are engine text and out of its scope. This check catches empty or trivial scenarios. With `maintain` it judges the scenarios and replays of the added and modified ACs plus AC coverage of the whole `acceptance.md`; scenarios of unchanged ACs keep the verdict they already have.
 - After an `ok: false` the next judgment receives its issues and only the scenarios and replays holdout-gen changed since, plus AC coverage of the whole `acceptance.md`. It returns `ok` when every issue is fixed and the changed files raise no new issue; files not changed keep the verdict of the previous judgment. `run.json` keeps the issues and the hashes of the judged files, so a resumed run judges the same way; an `ok` and a new `spec.lock` version clear them.
 - A tool check that cannot run (the tool exits with a usage or configuration error before reading the holdout, missing image or binary) is an engine `error`, exit code 4, with the tool output in the message. It never returns as `issues` to holdout-gen and never counts as a pass, because no change to spec, contract or holdout fixes it.
 
@@ -288,7 +341,7 @@ Body of the to-tickets file: What to build, Blocked by, acceptance criteria.
    - every ticket has a `**Covers:** AC-1, AC-2` line with the ids from `acceptance.md` (`**Covers:** AC-0` for the bootstrap);
    - the quiz shows the Covers line and the acceptance criteria for each ticket;
    - the clone may already contain part of the work: the breakdown covers only what the spec still requires on top of the existing code;
-   - without `.heideng/Dockerfile` in the repo, `01` is the bootstrap and every other ticket depends on `01`. The bootstrap contains only stack, `.heideng/Dockerfile`, `.heideng/test`, `.heideng/build`, `.heideng/start`, a runnable skeleton and a smoke test. The three scripts are POSIX `sh` with `#!/bin/sh`, because the project image's `/bin/sh` can be dash. Domain foundations (models, identity, base pages) are tickets of their own.
+   - without `.heideng/Dockerfile` in the repo, `01` is the bootstrap and every other ticket depends on `01`. The bootstrap contains only stack, `.heideng/Dockerfile`, `.heideng/test`, `.heideng/build`, `.heideng/start`, a runnable skeleton that listens on `0.0.0.0` on the port in `PORT`, and a smoke test. The three scripts are POSIX `sh` with `#!/bin/sh`, because the project image's `/bin/sh` can be dash. Domain foundations (models, identity, base pages) are tickets of their own.
 3. The skill's questions, quiz included, go to the ticket oracle.
 4. The engine converts the files: `id` = `T-<NN>` from the file number; `deps` from the tickets cited in "Blocked by"; `ac` from the Covers line; body unchanged.
 5. Graph-check.
@@ -328,7 +381,7 @@ The node runs only when the spec has no valid plan.
 ### Tickets written by the engine
 
 The engine writes from templates, at zero tokens:
-- fix tickets, from verify verdicts and from broken replays in regression. They contain only what the worker may know: scenario id and short reason, or the missing contract element;
+- fix tickets, from verify verdicts and from broken replays in regression. They contain only what the worker may know: scenario id, short reason, the scenario's intent in prose from `scenarios/<spec>/<id>.md`, or the missing contract element; for a red replay also the first line of its runtime error, never an assertion diff. The engine writes them only in a round with `AC-0` green;
 - `review` tickets (`R-<n>`), from `blocking` notes. They go through graph-check.
 - An engine ticket is valid for one round. If the same scenario or note recurs in the next round, the engine writes a new ticket with `supersedes` and, in the prompt, the `summary` of the previous one.
 
@@ -339,7 +392,7 @@ The engine writes from templates, at zero tokens:
 - The gate creates the integration branch `heideng/<slug>` from `main` with the commit of spec and contract.
 - Each ticket has a `git clone --local` (hardlinks) of the integration branch in `runs/<run>/clones/<ticket>`, on branch `heideng/<slug>@<ticket>`. The agent sees only its own repository, with `git diff` and `git log`.
 - The engine collects the work with `git fetch <clone> heideng/<slug>@<ticket>`.
-- Before each visit the engine runs `git fetch origin heideng/<slug>` in the clone, so the agent finds `origin/heideng/<slug>` up to date.
+- Before each visit the engine runs `git fetch origin heideng/<slug>` in the clone, so the agent finds `origin/heideng/<slug>` up to date. `origin` points to a host path and is not reachable from the container: the implement prompt says the branch is already fetched and the agent does not fetch, pull or push.
 
 ### Implement
 
@@ -370,7 +423,8 @@ The engine writes from templates, at zero tokens:
 - Sequential merge in topological order, then by id: `git merge --no-ff`, one merge commit per ticket.
 - On conflict the engine runs `git merge --abort` and puts the ticket in the next wave with `visit++` and the note "conflict with T-x". Implement runs `git merge origin/heideng/<slug>` in the clone and resolves.
 - If a merge touches `.heideng/Dockerfile` or a lockfile, the engine rebuilds the image before the wave-test.
-- The wave-test runs the tests once at the end of the wave. If red, the engine bisects the wave's merge commits (`--first-parent`), finds the first red merge, runs `git reset --hard` to the previous commit, re-merges the following tickets and retests. The culprit goes back to the queue with `visit++` and the test output.
+- The wave-test starts with the `AC-0` replays on the merged branch (verify steps 1 and 2, in a fresh product container with the dependency cache volume). A red `AC-0` is a [harness failure](#harness-failure): no bisect, no fix ticket.
+- Then the wave-test runs the tests once. If red with assertion errors, the engine bisects the wave's merge commits (`--first-parent`), finds the first red merge, runs `git reset --hard` to the previous commit, re-merges the following tickets and retests. The culprit goes back to the queue with `visit++` and the test output. If every red test reports the same runtime error class, the wave-test is a harness failure.
 
 ### Review (one per round)
 
@@ -389,13 +443,15 @@ The engine writes from templates, at zero tokens:
 
 | Step | Type | What |
 |---|---|---|
-| 1 Start | tool | Build from the integration branch, app container on the internal network, wait for the ready signal, seed (endpoint called by the engine or command run in the app container); all from the Run section of the contract. Baseline and regression use the same code |
-| 2 Replay | tool | Runs the replays, each on clean state (app container restart and seed); the outcome is the exit code; collects traces and screenshots. Playwright runs from the replay's directory, the same one as the `--list` check: with no config it finds only tests under its cwd |
-| 3 Agent | llm | `verify` skill: drives the scenarios without a replay, one per clean state, assesses non-binary evidence, classifies failures |
-| 4 Check | tool | Every scenario has a verdict, every verdict has evidence at the declared path and is consistent with the replay exit code |
+| 0 Smoke | tool | Steps 1 and 2 on the `AC-0` replays only. A red `s00-*` is a [harness failure](#harness-failure) and ends the verify |
+| 1 Start | tool | Build from the integration branch in a fresh product container with the dependency cache volume, product container on the internal network under the alias `heideng-app` (a host named `app` falls under the HSTS-preloaded `.app` TLD and Chromium forces it to HTTPS), wait for the ready signal, seed (endpoint called by the engine or command run in the product container); all from the Run section of the contract. Products with `Ready: none` skip start and ready. Baseline and regression use the same code |
+| 2 Replay | tool | Runs the replays, each on clean state (product container restart and seed); the outcome is the exit code; collects the evidence of the scenario's [surface](#surfaces). Playwright runs from the replay's directory, the same one as the `--list` check: with no config it finds only tests under its cwd. A `.sh` replay runs with `sh` inside the product container, from the project directory, with `APP_URL` on localhost: it drives the project itself (test suite, a second instance); the engine keeps its stdout and stderr in `evidence/<scenario>/` |
+| 3a Doctor | llm | The agent runs the Doctor section first, one check per declared surface. A red Doctor ends the agent: every scenario without a replay verdict is `harness_gap` with Doctor's output as evidence. The agent installs nothing, starts nothing and opens no port; the prompt states it |
+| 3b Agent | llm | `verify` skill: drives the scenarios without a replay, one per clean state, assesses non-binary evidence, classifies failures |
+| 4 Check | tool | Every scenario has a verdict, every verdict has evidence at the declared path and is consistent with the replay exit code. When every red replay reports the same runtime error class and no assertion error, the round is a harness failure |
 
 The replay exit code is a ceiling for the judge:
-- red replay: the agent chooses among `fail_product`, `fail_contract`, `harness_gap`, `unknown`; the engine rewrites a `pass` to `fail_product` and notes it in the report. `harness_gap` requires evidence from step 1 (start or doctor), otherwise it becomes `unknown`;
+- red replay: the agent chooses among `fail_product`, `fail_contract`, `harness_gap`, `unknown`; the engine rewrites a `pass` to `fail_product` and notes it in the report. `harness_gap` requires evidence from step 1 or 3a (start or Doctor), otherwise it becomes `unknown`;
 - green replay: the agent can lower to fail with evidence, never raise;
 - scenario without replay: the verdict is the agent's.
 
@@ -409,12 +465,20 @@ The engine reruns a red replay once on clean state. Two reds count as a fail. Re
 | Verdict | Engine | What implement sees |
 |---|---|---|
 | `pass` | - | - |
-| `fail_product` | fix ticket | scenario id + short reason |
-| `fail_contract` | fix ticket | missing contract element |
-| `harness_gap` | holdout-gen repairs with `maintain-...-from-spec`, then reruns | nothing |
-| `unknown` | counts as failure | scenario id |
+| `fail_product` | fix ticket | scenario id, short reason, scenario intent in prose |
+| `fail_contract` | fix ticket | missing contract element, scenario intent in prose |
+| `harness_gap` | holdout-gen repairs with `maintain-...-from-spec`, then reruns from step 0 | nothing |
+| `unknown` | counts as failure | scenario id, scenario intent in prose; for a red replay also the first line of its runtime error (navigation, network), never an assertion |
 
-Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions, Drive helpers). A failing start or seed is a contract or product defect. Its fix ticket carries the command the engine ran and the tail of the build, start or seed log, so implement reproduces the failure the way verify ran it.
+Repairing a `harness_gap` touches only Drive helpers and features of `verify/`; the engine regenerates Launch and Doctor from the harness contract. A failing start or seed with `AC-0` green at the bootstrap is a contract or product defect. Its fix ticket carries the command the engine ran and the tail of the build, start or seed log, so implement reproduces the failure the way verify ran it.
+
+#### Harness failure
+
+A verify round or a wave-test is a harness failure when `AC-0` is red, or when every red replay or test reports the same runtime error class and no assertion error. Error classes: connection refused, DNS, TLS, navigation timeout, missing browser, no tests found, permission denied on a mount or cache, missing module after build.
+
+- The engine writes no fix ticket and runs no bisect. Every scenario of the round gets `harness_gap`.
+- It writes one escalation `harness`: the error class, the first runtime error, `doctor.md`, build and start logs, the harness rule it matches.
+- The round does not count for the `patience` of the `rounds` loop.
 
 ### Baseline and regression (tool)
 
@@ -431,7 +495,7 @@ Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions
 - Tool check:
   - the diff touches only `README.md` and `docs/**`;
   - relative links point to existing files and every file in `docs/` is reachable from the README;
-  - every cited endpoint (`METHOD /path`) appears in `contract.md`;
+  - every cited endpoint (`METHOD /path`) is declared by `contract.md` or the spec. The check expands the compact notation of the contract (`POST|DELETE /x` is two methods, `/x[/:id]` is `/x` and `/x/:id`) and ignores parameter names (`:id`, `{id}`, `<id>`);
   - with `getting_started_runnable: true` the engine runs the getting started code block in a new container of the project image. The check passes with exit code 0 or, if the block starts the app, with the ready signal of the contract's Run section. With `false` the report flags the getting started as unverified.
 - If the check passes, the engine commits on the integration branch. If it fails, or if the node runs out of budget, the engine discards the changes and writes the reason in "To do for you". In both cases the run proceeds to the merge into main.
 
@@ -455,7 +519,7 @@ Repairing a `harness_gap` touches only `verify/` (Launch and Doctor descriptions
 
 ### Responder
 
-The responder answers on behalf of the product owner, using only the documents it sees.
+The responder answers on behalf of the product owner, using only the documents it sees. The [harness contract](#harness-contract) is one of them: on build-and-run matters it outranks spec and contract.
 
 ```json
 { "answers": [{ "question": "...", "answer": "...", "source": "verbatim quote", "uncovered": false }] }
@@ -467,7 +531,7 @@ The responder answers on behalf of the product owner, using only the documents i
 
 ### Citation check (tool)
 
-Every non-empty `source` must appear verbatim in spec, `contract.md`, `acceptance.md` or `decisions.md` (of the run or of an active spec). `uncovered: true` requires an empty `source`, `uncovered: false` requires a non-empty one. An answer that violates one of these rules becomes `uncovered`.
+Every non-empty `source` must appear verbatim in spec, `contract.md`, `acceptance.md`, `decisions.md` (of the run or of an active spec) or `harness.md`. `uncovered: true` requires an empty `source`, `uncovered: false` requires a non-empty one. An answer that violates one of these rules becomes `uncovered`.
 
 ## Stops, budgets and escalations
 
@@ -481,8 +545,8 @@ A loop stops when its work stops progressing.
 
 | Loop | `loop` | Success stop | Progress |
 |---|---|---|---|
-| Run (rounds) | `rounds` | holdout and regression green | the set of failed or `unknown` scenarios changes (for regression, the set of red replays); with none failing, fewer tickets stay queued |
-| Ticket (visits) | `visits` | green tests + merge | the red tests change or decrease |
+| Run (rounds) | `rounds` | holdout and regression green | the set of failed or `unknown` scenarios changes (for regression, the set of red replays); with none failing, fewer tickets stay queued. A round that ended in a [harness failure](#harness-failure) does not count |
+| Ticket (visits) | `visits` | green tests + merge | the failing tests of the red output (test, wave-test or budget note) change, judged by the engine on that output; the same failing tests again are no progress whatever the node's summary says. The escalation carries the output |
 | llm node session | `holdout-gen`, `tickets` | valid output against the schema | the session changed files or output since the previous pass |
 | Holdout oracle, ticket oracle | `holdout-oracle`, `ticket-oracle` | `ok: true` | `fixed` >= 1: the oracle reports how many issues of the previous judgment are fixed |
 | Holdout tool check, graph-check | `holdout-check`, `graph-check` | all checks pass | the set of check errors changes |
@@ -494,7 +558,7 @@ The `stop` event of a loop has kind `no_progress` or `max_passes` and the `loop`
 ### `error` and `budget` outcomes of an llm node
 
 - `error` (API, network, container that does not start): the engine repeats the same `exec` with `attempt+1` and backoff, up to 2 attempts. The cost of interrupted attempts goes to the report. Beyond the limit the engine opens a `run`-level escalation and exits with code 4. These are the retries of principle 2.
-- `budget` (usd, timeout, turns): the per-call limits of `claude` (`--max-turns`, `--max-budget-usd`, timeout) are engine constants and bound one pass, not the node. The partial content counts. Route applies the node's fallback:
+- `budget` (usd, timeout, turns): the per-call limits of `claude` (`--max-turns`, `--max-budget-usd`, timeout) are engine constants and bound one pass, not the node. The partial content counts. The session to resume is the `session_id` of the stream messages: a call killed on timeout has no `result` message and still resumes. Route applies the node's fallback:
 
 | Node | Fallback on `budget` |
 |---|---|
@@ -503,7 +567,7 @@ The `stop` event of a loop has kind `no_progress` or `max_passes` and the `loop`
 | holdout oracle, ticket oracle | like `ok: false` |
 | responder | all answers `uncovered` |
 | review | round without notes, flagged in the report |
-| verify (agent) | scenarios without a verdict become `unknown` |
+| verify (agent) | scenarios without a verdict become `unknown`; with a red Doctor, `harness_gap` |
 | docs | discards the changes, the run proceeds |
 | report | report without summary |
 
@@ -545,6 +609,7 @@ The `stop` event of a loop has kind `no_progress` or `max_passes` and the `loop`
 ```
 
 - `seq` is monotonic and is the SSE `id` (reconnection with `Last-Event-ID`).
+- Every event of a ticket's node carries `ticket`, `visit`, `round` and `wave`, llm nodes (implement) as much as tool nodes (test): the UI places executions in ticket lanes by these fields.
 - Context fields live in the envelope, outside `data`, to filter without parsing.
 - The UI shows interrupted attempts; the report counts their cost.
 
@@ -608,13 +673,14 @@ The engine has a TypeScript schema for each version. The server converts old run
 - With docker the engine builds with the classic builder, because BuildKit rejects `--network` to a user network and every build goes through the egress proxy. Podman accepts it.
 - `.heideng/Dockerfile` is a repo file, and agents create and modify it like any other file.
 - `<hash>` covers `.heideng/Dockerfile` and the lockfiles. The engine rebuilds at the wave boundary when the hash changes.
-- Bootstrap: with a repo without `.heideng/Dockerfile`, `T-01` runs alone in the first wave, in `heideng-base`, and creates stack, `.heideng/*` and skeleton. Before its tests the engine checks that `.heideng/Dockerfile` starts `FROM heideng-base`; otherwise the visit is red with the reason. After the merge the engine builds the image. If the spec fixes the stack, the bootstrap respects it; otherwise the choice is a question to the answerer and goes to `decisions.md` as `uncovered`.
+- Bootstrap: with a repo without `.heideng/Dockerfile`, `T-01` runs alone in the first wave, in `heideng-base`, and creates stack, `.heideng/*` and skeleton; its prompt carries the build-and-run rules of the harness contract and the declared surfaces. Before its tests the engine checks that `.heideng/Dockerfile` starts `FROM heideng-base`; otherwise the visit is red with the reason. After green tests the engine runs the `AC-0` smoke: verify steps 1 and 2 on the `s00-*` replays, from the clone (project image, build in a fresh container with the dependency cache volume, product container under the alias `heideng-app`, ready signal, seed, replays from where their surface says). A red `s00-*` makes the visit red with the replay's runtime error and the tail of the build or start log, and the next visit fixes it. `T-01` merges only with every `s00-*` green. The product container stops after the check. After the merge the engine builds the image. If the spec or the gate decisions fix the stack, the bootstrap respects them; otherwise the choice is a question to the answerer and goes to `decisions.md` as `uncovered`.
 
 ### Egress
 
 - A proxy container (domain allowlist, HTTP CONNECT) is the only one with outbound internet access.
 - The other containers run on an `--internal` network with `HTTPS_PROXY` pointing to the proxy. A tool that ignores the proxy has no route to the internet. This works with podman and docker, macOS included.
-- Node allowlist: provider endpoints and package registries (`container.allow`).
+- Node allowlist: provider endpoints and package registries (`container.allow`). An entry `host:port` allows that host on that port only.
+- `heideng-exec` reaches the engine on the host through the proxy: the verify proxy allows `host.docker.internal:<port of the exec endpoint>` (`host.containers.internal` with podman) and no other host port.
 - Agents write the Dockerfile, so the project image build also goes through the proxy, with the allowlist extended to package mirrors (`container.build_allow`).
 - `heideng init` derives `allow` from the detected package manager: `api.anthropic.com` plus its registries (npm, pnpm, bun: `registry.npmjs.org`; yarn: also `registry.yarnpkg.com`, `repo.yarnpkg.com`; pip, uv, poetry: `pypi.org`, `files.pythonhosted.org`; go: `proxy.golang.org`, `sum.golang.org`). `build_allow` adds the OS package mirror; builds use `allow + build_allow`.
 - The builds of `heideng-base` and `heideng-verify` use an allowlist fixed in heideng (Debian and npm mirrors, Playwright's browser download hosts `cdn.playwright.dev` and `storage.googleapis.com`), independent of the project config.
@@ -634,6 +700,41 @@ The engine has a TypeScript schema for each version. The server converts old run
 
 - `parallel` per node and a global semaphore on agents (`limits.agents`).
 - The same `CLAUDE_CODE_OAUTH_TOKEN` runs in N containers; the practical limit is the subscription rate limit.
+
+## Harness contract
+
+The harness contract describes how the engine builds, starts, reaches and observes the product. heideng writes it from its own constants; no node writes or edits it.
+
+```
+~/.heideng/harness.md     written by heideng init and rewritten at every heideng upgrade; its hash is in run.start
+```
+
+Sections:
+
+- **Build and run.** `.heideng/build`, `.heideng/start` (absent with `Ready: none`), `.heideng/test`: POSIX `sh` with `#!/bin/sh`, run through their shebang when executable, from the project directory. `.heideng/Dockerfile` starts `FROM heideng-base`, no `COPY`, no `CMD`. The product container runs under the alias `heideng-app` on the internal network, as the host user, with the dependency cache volume writable by that user. A product with a port listens on `0.0.0.0` on the port in `PORT`. The engine polls the ready signal from another container.
+- **Run section grammar.** One line per value; the engine parses only these:
+  - `- Surfaces: http, browser` (one or more from the [surfaces](#surfaces) table);
+  - `- Port: <n>` (surfaces `http`, `browser`, or `exec` with a port);
+  - `- Ready: GET <path>` | `` - Ready: `<command>` `` (exit 0 in the product container) | `- Ready: none`;
+  - `- Seed: POST <path>` | `` - Seed: `<command>` `` | `- Seed: none`;
+  - `- Env: KEY, KEY`.
+- **Verify.** `heideng-verify` contains Playwright with browsers, playwright-cli and `heideng-exec`; it installs nothing at run time; its egress is the engine's allowlist plus `heideng-app` and the exec endpoint. Per surface: target, where replays run, evidence.
+- **Replays.** Layout `replays/<slug>/<id>.spec.ts` (surfaces `http`, `browser`, `desktop`) or `<id>.sh` (surfaces `exec`, `files`); checks `tsc --noEmit` and `playwright test --list` from `replays/<slug>` with no config; run `playwright test <file> --output=/evidence/traces` from the same directory; `.sh` with `sh` in the product container from the project directory; evidence root `/evidence`.
+- **Evidence the engine captures.** `evidence/start/build.log`, `start.log`, `seed.log`, `doctor.md`; per scenario `replay.log`, traces, screenshots, stdout and stderr of `.sh` replays. A scenario that reads the product's output reads these files.
+- **Clone.** `origin` is a host path, already fetched; no fetch, pull or push.
+
+Readers:
+
+| Reader | Use |
+|---|---|
+| gate | checklist item on the Run section and the build-and-run rules; the harness line is the source of its corrections |
+| holdout-gen | Launch and Doctor of the `verify` skill come from a template heideng fills from the harness contract and the Run section; the prompt carries the contract |
+| implement, tickets | in the prompt: build-and-run and clone rules, the declared surfaces |
+| verify (agent) | in the prompt: verify, replays and evidence rules |
+| responder | a document like the others; on build-and-run matters it outranks spec and contract |
+| citation check | `source` quotes from `harness.md` are valid |
+
+An answer or decision that contradicts a build-and-run rule is rewritten by the engine as the harness rule, with the event `harness_override` and a line in the report.
 
 ## Claude Code backend
 
@@ -724,7 +825,7 @@ The project customizes the phases without touching heideng's prompts and skills.
   - During the run: a "now" line and in-progress bars that grow.
   - Click on a row: detail of the node or ticket.
 - Detail:
-  - ticket: Stream, Prompt, Response, Diff, Test, Visits;
+  - ticket: Stream, Prompt, Response, Diff, Test, Visits; a ticket with no execution in this run (done in a reused plan) shows "no execution in this run" in the execution tabs;
   - llm node: Stream, Prompt, Response, Cost; tool node: Log, State;
   - scenario: Verdicts per round, Evidence (screenshots, Playwright traces), Replay;
   - no selection: Decisions (`decisions.md`, `uncovered` flag), Stops/escalations, Merges/bisect, Events.
@@ -753,7 +854,7 @@ The project customizes the phases without touching heideng's prompts and skills.
 ### Stack
 
 - Server: `Bun.serve` / `node:http` inside the CLI. Endpoints: `/`, `/api/run`, `/api/events` (SSE), `/api/node/:exec/*` (stream, prompt, response, status, `qa`), `/api/runs`, `POST /api/control`.
-- Frontend: a single HTML file with Preact + htm bundled in the package.
+- Frontend: a single HTML file with Preact + htm bundled in the package. The UI re-renders on every event, so a `<select>` gives its options their text in the `label` attribute: the bundled Preact clears and rewrites the value of an option with text children on every render, and Chrome closes an open dropdown when its options change.
 
 ## Report and metrics
 
@@ -799,7 +900,7 @@ git diff --stat main...heideng/<slug>
 
 | Command | What it does | Main flags |
 |---|---|---|
-| `heideng init` | detects stack, package manager and commands; generates `heideng.yaml` (with the allowlists of the package manager, see [Egress](#egress)), empty `contract.md`, `.heideng/Dockerfile` if the stack is detectable, the Heideng section of `CLAUDE.md`; flags an `AGENTS.md` not included by `CLAUDE.md` | `--force` |
+| `heideng init` | writes `~/.heideng/harness.md` ([harness contract](#harness-contract)); detects stack, package manager and commands; generates `heideng.yaml` (with the allowlists of the package manager, see [Egress](#egress)), empty `contract.md`, `.heideng/Dockerfile` if the stack is detectable, the Heideng section of `CLAUDE.md`; flags an `AGENTS.md` not included by `CLAUDE.md` | `--force` |
 | `heideng accept <spec>` | gate: `heideng/<slug>` branch with `spec.md`, `acceptance.md`, `contract.md`, `spec.lock` | `--plain` |
 | `heideng run <spec>` | starts the run and the UI | `--no-ui` |
 | `heideng resume [run]` | with a live engine (pid in `run.lock`) writes `resume` to `control.jsonl`; otherwise relaunches the engine on the node in progress | `--add-usd`, `--add-passes`, `--add-time` |
@@ -971,12 +1072,13 @@ contract.md
     spec.md
     acceptance.md
     spec.lock
-    decisions.md                                 committed at the end of the run
+    decisions.md                                 gate decisions at accept, the run's decisions at the end of the run
 ```
 
 heideng state:
 
 ```
+~/.heideng/harness.md       harness contract, written by heideng
 ~/.heideng/<project>/
   run.lock
   env                         app variable values
@@ -1006,7 +1108,7 @@ heideng state:
 
 | What | Policy |
 |---|---|
-| Containers, app and proxy networks | removed at the end of the node or run (`--rm`) |
+| Containers, app and proxy networks | removed at the end of the node or run (`--rm`). A killed engine leaves them behind: `resume` removes the project's containers, and every egress start removes the proxy and network with its own name before creating them |
 | Ticket clones | kept while the run is open (needed for resume); removed after the merge into main or `heideng close` |
 | `heideng-<project>:<hash>` images | the current and previous ones kept; the others removed at the start of the run |
 | `heideng-base`, `heideng-verify` | the ones with the current definition hash kept |
