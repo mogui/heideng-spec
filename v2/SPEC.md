@@ -1,0 +1,458 @@
+# Heideng v2 - Specification
+
+Heideng (黑灯工厂, heideng gongchang, "lights-out factory") is a CLI that develops software from a spec with no people during the run. A person approves the spec before the run and reads the report after. In between, a fixed pipeline writes code ticket by ticket, verifies it against holdout checks the coding agents cannot see, and merges it into `main` only if verification passes.
+
+- Input: an approved spec. Output: code merged into `main` and a report.
+- A run works one spec on one project (a git repo). A project has at most one active run.
+- The product builds, runs and is verified on the person's machine, with the person's toolchain: a web app, an API, a CLI, a library or a native macOS app go through the same pipeline.
+- Agents run only on Claude Code. Isolation is the OS sandbox of Claude Code for agents and of [`srt`](https://github.com/anthropics/sandbox-runtime) for the product's scripts. heideng uses no containers.
+
+## References
+
+- Level 5 "dark factory" from Dan Shapiro's [The Five Levels](https://www.danshapiro.com/blog/2026/01/the-five-levels-from-spicy-autocomplete-to-the-software-factory/); holdout scenarios invisible to the agents from StrongDM's [Software Factory](https://factory.strongdm.ai).
+- Skills and vocabulary (`to-tickets`, `tdd`, `code-review`) from Matt Pocock's [skills](https://github.com/mattpocock/skills).
+- Claude Code [sandboxing](https://code.claude.com/docs/en/sandboxing) and [permissions](https://code.claude.com/docs/en/permissions).
+
+## Principles
+
+1. **The engine decides the path, the agent does the work.** Routing is deterministic code over outcomes, counters and budgets. Inside a node the agent works with its own tool loop and returns structured output.
+2. **Every loop has two stops.** Success comes from a check other than the worker. The budget stop closes the loop with a written reason: `patience` passes without progress, the `max_passes` cap, or the run's `usd` and `wall_clock`.
+3. **The worker cannot see or change its verifier.** Holdout checks live outside the repo, in a path the OS sandbox denies to every worker process and to every product script. On a failed check the worker receives the check's intent and its output, never its code.
+4. **Exit codes decide "done".** Build, test and holdout checks are scripts; their exit code is the verdict. LLM judges assess only what code cannot (holdout quality, code review), on a model different from the worker's.
+5. **Everything heideng runs on the product is a script.** Build, test, start, ready and every holdout check are executables with a shebang, run on the host from a known directory with a known environment. heideng knows no stack, no port grammar, no surface.
+6. **One thing at a time.** Tickets run in sequence on one working clone. A red test has one candidate cause, the ticket in progress. There are no merges between tickets, no conflicts and no bisect.
+7. **The node boundary is the unit of durability.** After every node the engine saves state; a crash loses only the node in progress, which restarts from scratch on resume.
+8. **The metric is cost per verified AC.** Total cost divided by the ACs whose holdout checks pass.
+
+## Glossary
+
+| Term | Meaning |
+|---|---|
+| Spec | Free-form document describing the change. After `accept` it lives in `.heideng/specs/<slug>/spec.md` |
+| AC | Acceptance criterion with a stable id (`AC-1`) in `acceptance.md`, marked `auto` or `manual` |
+| Contract | `contract.md`: host prerequisites, product scripts, how checks drive and observe the product |
+| Check | Holdout unit: `check.md` (ACs, intent, assertions) plus an executable `run`, optional `overlay/` |
+| Overlay | Files a check adds to a disposable checkout before the build (test files compiled against the product) |
+| Smoke | Engine step: `build`, `test`, then `start` and `ready` when the product has them. Part of every test step and of verify |
+| Ticket | Unit of work. `T-<NN>` from the plan, `F-<n>` from failed checks, `R-<n>` from blocking review notes |
+| Plan | Ticket list approved by graph-check for one `spec.lock` version |
+| Visit | One pass of a ticket through implement and test |
+| Round | Tickets in sequence until the queue is empty, then verify and review |
+| Work clone | The run's single git clone of `heideng/<slug>`, where every ticket is implemented |
+| Scope | Isolation unit of an execution: a `HOME` of its own and the only writable paths besides cwd and `TMPDIR` |
+| Patience | Consecutive passes without progress a loop tolerates |
+| Escalation | Problem the run hands to the person |
+
+## Pipeline
+
+```mermaid
+flowchart TD
+    accept[/"heideng accept: interactive Claude Code session with the person"/] --> acheck{"accept check: ACs, contract, Requires on host"}
+    acheck -->|errors| accept
+    acheck -->|ok| lock["branch heideng/slug + spec.lock"]
+    lock --> doctor{"doctor: Requires, sandbox probe"}
+    doctor -->|red| esc[escalation]
+    doctor -->|ok| hgen["holdout-gen"]
+    hgen --> hcheck{"holdout check + holdout oracle"}
+    hcheck -->|issues| hgen
+    hcheck -->|ok| baseline["baseline: active checks on main"]
+    baseline --> plan["plan: to-tickets"]
+    plan --> gcheck{graph-check}
+    gcheck -->|errors| plan
+    gcheck -->|ok| queue
+
+    subgraph ROUND
+        queue[(queue, plan order)] --> impl["implement next ticket in the work clone"]
+        impl --> test{"test: smoke in srt"}
+        test -->|"red: visit++"| impl
+        test -->|green| commit["commit + push to heideng/slug"]
+        commit --> queue
+        queue -->|empty| verify{"verify: disposable checkout, overlays, smoke, checks"}
+        verify --> review["review"]
+        review --> route{route}
+    end
+
+    route -->|"fix or review tickets"| queue
+    route -->|"all checks pass, no blocking notes"| regr{regression}
+    route -->|"budget stop or escalation"| report
+    regr -->|"red: fix tickets"| queue
+    regr -->|green| mmain{"merge main"}
+    mmain --> report[report]
+    esc --> report
+```
+
+| Node | Type | What |
+|---|---|---|
+| accept | llm, interactive | completes the spec with the person; writes spec, ACs, contract, decisions |
+| accept check | tool | format of ACs and contract, Requires commands run on the host |
+| doctor | tool | Requires commands, sandbox probe |
+| holdout-gen | llm | checks from spec, ACs and contract, without the repo |
+| holdout check | tool | traceability, executables, sections |
+| holdout oracle | llm judge | coverage and non-trivial assertions |
+| baseline | tool | checks of active specs on `main`; red ones leave regression |
+| plan | llm | `to-tickets` on a clone of the branch |
+| graph-check | tool | acyclic, dependencies exist, every AC covered |
+| implement | llm | one ticket in the work clone, sandboxed |
+| test | tool | smoke in the work clone, under `srt` |
+| verify | tool | holdout checks on a disposable checkout |
+| review | llm judge | `code-review` on the round diff |
+| route | tool | new round, regression or stop |
+| regression | tool | checks of active specs on the branch, minus baseline reds |
+| merge main | tool | `git merge --no-ff heideng/<slug>` |
+| report | tool + llm | `report.md`; the llm writes only the summary |
+
+Every budget stop and escalation leads to report. An escalation inside a round stops the run after the ticket in progress.
+
+## Project interface
+
+### Scripts
+
+The product exposes itself to heideng through scripts in the repo.
+
+| Script | Required | Exit 0 means |
+|---|---|---|
+| `.heideng/build` | yes | the product is built |
+| `.heideng/test` | yes | the project's tests pass |
+| `.heideng/start` | products with a long-running process | runs in the foreground until killed |
+| `.heideng/ready` | with `start` | the started product accepts requests |
+
+Execution rules, the same in every node:
+- Run through the shebang, from the root of the checkout, under `srt` with the [product sandbox](#product-sandbox).
+- Environment: `HEIDENG_PORT` (a free port the engine picks), `HEIDENG_DATA` (an empty directory per execution), `HEIDENG_EVIDENCE` (directory for files the run keeps), `HOME` set to the [scope home](#scopes). `start`, `ready` and check `run` also receive the values of `~/.heideng/<project>/env`; `build` and `test` run without them everywhere, so the worker and the engine see the same result.
+- Timeout 20 minutes per script; a timeout is red with the note "timeout".
+- `start` runs in its own process group; the engine polls `ready` every second for 60 seconds, then kills the group at the end of the step.
+
+### Contract
+
+`contract.md` lives in the repo and is cumulative. Each spec changes only the parts it touches; the delta enters `main` with the run's merge.
+
+- **Requires.** One line per host prerequisite, as a command that exits 0 when the prerequisite holds: `` - Requires: `xcodebuild -version` ``, `` - Requires: `node -e "process.exit(+process.versions.node.split('.')[0] < 22)"` ``. The engine runs them on the host and inside the sandboxes.
+- **Run.** Which of `start` and `ready` exist and what the product reads from the environment.
+- **Drive.** What checks use to reach the product: routes, commands and exit codes, public modules and types, UI labels and accessibility identifiers, the overlay directories checks may write (`Tests/HoldoutTests/`). Overlay directories exist in the repo, empty, already wired into the build (a test target, a test glob), and `.heideng/test` does not run them. If a behavior depends on time, Drive declares the time control.
+- **Observe.** Evidence a check reads: output, files under `HEIDENG_DATA`, DB rows.
+
+### How checks reach the product
+
+| Product | Check `run` | Overlay |
+|---|---|---|
+| HTTP API | `curl` on `localhost:$HEIDENG_PORT`, the product already started by the engine | none |
+| Web UI | `npx playwright test` from the overlay directory | Playwright spec using contract locators |
+| CLI | runs the built binary from `HEIDENG_APP_DIR`, reads stdout, exit code, files | none |
+| Library | runs the project's test runner on the overlay test file | test file importing the public API |
+| macOS app | `xcodebuild test -only-testing:HoldoutTests/<id>` | XCTest or XCUITest file in the overlay directory |
+
+## Accept: `heideng accept <spec>`
+
+The only step of a spec where a person takes part.
+
+1. The engine prepares `~/.heideng/<project>/accept/<slug>/` with a copy of the spec, `contract.md`, the `acceptance.md` of active specs and the accept prompt, and starts an interactive `claude` session there. The person and the agent talk directly.
+2. The agent:
+   - checks the spec against the contract sections and proposes what is missing (Requires, scripts, Drive, Observe);
+   - lists the product choices the spec leaves open (language and version, dependencies, normalization of input, output formats, ordering tie-breaks, error precedence) and asks the person for each;
+   - extracts the ACs with stable ids, each `auto` (a check can settle it) or `manual` (the person judges it after the run);
+   - lists the ACs of active specs this spec modifies or removes;
+   - writes `spec.md`, `acceptance.md`, `contract.md` and `decisions.md` in the directory.
+3. When the session ends the engine runs the accept check:
+   - ACs: unique ids, `auto` or `manual` on each, superseded ACs exist;
+   - contract: the four sections, at least one Requires line, Drive lists the overlay directories;
+   - every Requires command exits 0 on the host.
+4. Errors: the engine prints them and `heideng accept <spec>` resumes the same session with the errors as the first message.
+5. Ok: the engine shows ACs, contract diff and decisions, asks `y/n`, creates `heideng/<slug>` from `main`, commits the four files under `.heideng/specs/<slug>/` (and `contract.md` at the root) and writes `spec.lock`: version, file hashes, superseded ACs.
+
+`heideng run` rejects a spec without a valid lock, a branch that does not start from `main`, a branch checked out in the project repo, or a spec already merged on this lock. A new `accept` on an open run increments the lock version and discards the plan; the next round plans on top of the branch.
+
+## Holdout
+
+```
+~/.heideng/<project>/holdout/<slug>/
+  manifest.json        spec.lock hash, file hashes, oracle verdict
+  <check-id>/
+    check.md           ACs, Intent, Assertions
+    run                executable, exit 0 = pass
+    overlay/           optional, mirrors paths of the repo
+~/.heideng/<project>/holdout/retired/<slug>/<check-id>/   with the reason
+```
+
+- `check.md` has three sections. **ACs**: the ids it covers. **Intent**: the behavior in user terms, the only text a worker may receive. **Assertions**: what `run` verifies, for the oracle.
+- An `auto` AC has at least one check. A check covers one or more ACs of its spec.
+- Overlay paths fall under the overlay directories of the contract's Drive. An overlay file that would overwrite a file of the checkout makes the check red with "overlay collision", an escalation of kind `holdout`.
+
+### Generation
+
+- holdout-gen runs with cwd `holdout/<slug>/` and sees spec, `acceptance.md`, `contract.md`, `decisions.md` and the active holdout of other specs. It has no access to the repo.
+- On a later spec it works on the contract delta and the superseded ACs: a modified AC gets rewritten checks, a removed AC moves its checks to `retired/`.
+- Holdout check (tool): every `auto` AC covered, every cited AC exists, `run` executable with a shebang, `check.md` sections present, overlay under the declared directories.
+- Holdout oracle: coverage and non-trivial assertions, on `check.md` and `run`. Output `{ ok, issues[], fixed }`. After `ok: false` the next judgment receives its issues and only the files changed since.
+- Reuse: with the manifest validated for the current `spec.lock` hash and file hashes unchanged, generation and oracle are skipped.
+- Inside a run checks are immutable; verify rechecks the hashes before running them.
+
+## Plan
+
+- The plan node runs `/to-tickets <spec>` on a fresh clone of `heideng/<slug>`, sandboxed, with the rules:
+  - every ticket has a `**Covers:** AC-1, AC-2` line;
+  - the breakdown covers only what the code on the branch does not do yet;
+  - without `.heideng/build` and `.heideng/test` on the branch, ticket `01` is the bootstrap: stack, the scripts of the contract's Run section, the overlay directories of the contract's Drive wired into the build, a skeleton and one test. Every other ticket depends on it.
+- The engine converts the files into `T-<NN>` with `deps` from "Blocked by" and `ac` from Covers. Other changes in the clone are discarded.
+- Graph-check: acyclic, dependencies exist, every AC (`auto` and `manual`) covered by a ticket, no ticket cites a missing AC. Errors resume the plan session.
+- The plan is stored in `~/.heideng/<project>/plans/<slug>/` under the `spec.lock` hash. A run with a valid plan skips the node; tickets whose commit is an ancestor of `heideng/<slug>` count as done.
+- Execution order: topological, then by id.
+
+## Round
+
+### Work clone
+
+- `runs/<run>/work` is a `git clone` of the project on `heideng/<slug>`. Only the engine runs git commands that write.
+- Before each ticket the engine records the base sha. After a green test it commits the working tree as `<id>: <title>` and pushes to `heideng/<slug>` in the project repo.
+- A ticket that fails or is blocked is reset with `git reset --hard <base>` and `git clean -fdx -e <cache dirs>`.
+
+### Implement
+
+- `claude -p` with cwd the work clone and the [worker sandbox](#worker-sandbox). Every visit is a new session.
+- Prompt: ticket, spec, `acceptance.md`, `contract.md`, `decisions.md`, the execution rules of the scripts. With `visit > 1`, the compressed output of the previous red test.
+- Skills: `/tdd`; `diagnosing-bugs` with `visit > 1`.
+- Output: `{ status: done|blocked, summary, decisions[], skipped[] }`. The agent asks nothing: where ticket and documents do not decide, it takes the most conservative choice and records it in `decisions[]`. The engine appends them to the run's `decisions.md` and to the report.
+- `blocked` marks the ticket `escalated`, its dependents `blocked`, and opens an escalation.
+- A diff that touches `.heideng/*` outside the bootstrap is a mandatory note for review.
+
+### Test (tool)
+
+- Smoke in the work clone: `build`, `test`, then `start` and `ready` when present, under `srt`.
+- Green: commit and next ticket.
+- Red: `visit++`, implement again with the output compressed at zero tokens (failed tests with message and stack, repeated lines collapsed, otherwise the tail).
+- Progress: the set of failing tests changes or the first error line changes. `patience` visits without progress make the ticket `failed`: reset, dependents `blocked`, the run continues.
+
+### Verify (tool)
+
+1. Holdout hashes match the manifest; a mismatch is an engine error.
+2. Disposable checkout of `heideng/<slug>` in `runs/<run>/verify/r<n>/`, overlays of every check of the spec copied in. The checkout holds only the overlays; check `run` is never copied into it.
+3. `build` on the checkout. Red: no check runs; one ticket `F-<n>` "build red with holdout overlays" carries the build output with every line that cites an overlay path or quotes overlay content removed: the ticket keeps product files, missing symbols and compiler messages. The round ends.
+4. Each check in turn: `start` and `ready` when present, then `run` executed from its own holdout directory with `HEIDENG_APP_DIR` set to the checkout, stop. The exit code is the verdict.
+5. A red check runs once more. Red then green is `flaky`, a verdict of its own that counts as fail.
+
+Verdicts become fix tickets:
+- One `F-<n>` per failed check with check id, ACs, Intent and the last 40 lines of `run` output, holdout paths replaced by `<holdout>`.
+- A `flaky` check gets the same ticket with the output of both executions and the note "flaky: same code, two verdicts".
+- Failed checks whose first error line is identical share one ticket.
+- A check that fails in the next round again produces a new ticket with `supersedes` and the `summary` of the previous one.
+
+The checkout and its scope home are deleted after the step; nothing from verify returns to the work clone.
+
+### Review
+
+- One `claude -p` session per round, model different from implement, on a clone of `heideng/<slug>`; changes it makes are discarded.
+- `code-review` on `base_round..heideng/<slug>`, with spec and `acceptance.md`. Output `{ notes: [{ axis: spec|standards|lean, severity: blocking|minor, msg, files[] }] }`.
+- Round 1: every `blocking` note becomes `R-<n>`. Later rounds: only `blocking` notes on the `spec` axis. Other notes go to the report.
+
+### Route
+
+- Fix or review tickets queued: new round.
+- All checks pass and no ticket queued: regression. `manual` ACs never hold the run: they are listed in "To do for you" and the person judges them on `main` after the merge.
+- Progress of the `rounds` loop: the set of failed checks changes; with none failing, fewer tickets queued.
+
+### Regression and merge into main
+
+- Baseline, at run start: checks of active specs on a checkout of `main`. Red ones are excluded from regression and listed in the report.
+- Regression: checks of active specs on the branch, like verify. Red: fix tickets and a new round.
+- Merge into main: the run's `decisions.md` committed under `.heideng/specs/<slug>/`, then `git merge --no-ff heideng/<slug>`. If `main` moved, the engine merges `main` into the branch and repeats smoke, verify and regression first; a conflict or a red step is an escalation.
+
+## Isolation
+
+### Worker sandbox
+
+Every llm node runs `claude -p` on the host with settings generated per execution and passed with `--settings`, `--setting-sources ""`, `--permission-mode dontAsk`, `--allowedTools` of the node, `CLAUDE_CONFIG_DIR=runs/<run>/claude/`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "failIfUnavailable": true,
+    "allowUnsandboxedCommands": false,
+    "excludedCommands": [],
+    "filesystem": {
+      "denyRead": ["~/.heideng", "<project repo>"],
+      "allowRead": ["<cwd>", "<scope home>"],
+      "allowWrite": ["<scope home>", "<sandbox.write from heideng.yaml, under the scope home>"]
+    },
+    "network": { "allowedDomains": ["<sandbox.allow from heideng.yaml>"], "allowLocalBinding": true }
+  },
+  "permissions": {
+    "deny": ["Read(~/.heideng/**)", "Edit(~/.heideng/**)", "WebFetch", "WebSearch"]
+  }
+}
+```
+
+- Bash and every subprocess cannot read heideng's home (holdout, plans, other runs) or the project repo, and write only in cwd, `$TMPDIR` and the toolchain caches of `sandbox.write` under the scope home.
+- Read rules resolve by path length: the narrower path wins. `allowRead: <cwd>` therefore reopens the work clone inside the denied `~/.heideng`, and a `denyRead` inside an allowed directory holds. The doctor probe verifies both directions.
+- holdout-gen and the oracle run with cwd `holdout/<slug>/`, re-allowed under the heideng home; the project repo and the runs stay denied.
+- `excludedCommands` from `heideng.yaml` run outside the sandbox. The report lists them under "Isolation weakened".
+
+### Product sandbox
+
+The engine runs every script of the product (build, test, start, ready) and every check `run` through `srt --settings <file>` with the same filesystem and network rules. Code written by an agent therefore never runs with access to the holdout. In verify the checkout contains only the overlays copied by the engine; the checkout is disposable and never returns to the repo.
+
+A check `run` executes with `holdout/<slug>/<id>/` re-allowed read-only and the same write rules as the checkout it drives. Product code it loads (a test runner, a compiled overlay) can therefore read that check and write only inside the verify scope, which the engine deletes with the checkout.
+
+### Scopes
+
+Every execution belongs to a scope. The scope owns a `HOME` and the only writable paths besides cwd and `TMPDIR`; every `~`-relative entry of `sandbox.write` resolves under the scope's `HOME`, and the person's real home stays readable and never writable.
+
+| Scope | `HOME` | Executions | Lifetime |
+|---|---|---|---|
+| build | `runs/<run>/home/` | implement, plan, review, the test step | the run |
+| verify | `runs/<run>/verify/r<n>/home/` | `build`, `start`, `ready` and check `run` in verify, baseline and regression | the step |
+| holdout | `holdout/home/` | holdout-gen, oracle | until the checks change |
+| accept | `accept/<slug>/home/` | the accept session | the accept |
+
+Nothing written in the verify scope is readable from the build scope: the two share no directory, nothing writes in the real home, and the build scope reads `~/.heideng` only in its cwd and its home.
+
+### Audit
+
+After every llm node the engine scans the tool calls in `stream.jsonl` for paths under `~/.heideng` outside the node's cwd and scope home. A hit voids the visit (reset of the work clone), emits a `leak` event and opens an escalation.
+
+### Doctor
+
+`heideng doctor` runs at `init`, at `accept` and at the start of every run:
+- every Requires command, on the host, under `srt` and inside a probe Claude Code session with the worker settings;
+- the probe session runs `probe.sh` in its cwd, which writes `result.json`: a canary file under `~/.heideng/<project>/` is unreadable with `cat` and with `python3`, a file in the cwd is readable, a write to the real home fails, a write under the scope `HOME` succeeds, a server on `localhost` answers;
+- the probe Read of the canary with the Read tool is denied.
+
+A red doctor stops before any node, with the failing command and the setting that resolves it (`sandbox.write`, `sandbox.allow`, `sandbox.excluded`).
+
+### Credentials and secrets
+
+- Claude Code authenticates with the person's login or `ANTHROPIC_API_KEY`.
+- App secrets: names in `.heideng/env`, values in `~/.heideng/<project>/env`. The engine injects the values into `start`, `ready` and check `run`. Agents and `build`/`test` see only the names.
+
+## Stops, budgets and escalations
+
+| Loop | Success stop | Progress |
+|---|---|---|
+| `rounds` | checks and regression green | the set of failed checks changes |
+| `visits` | test green | failing tests or first error line change |
+| `holdout-oracle` | `ok: true` | `fixed >= 1` |
+| `holdout-check`, `graph-check` | all checks pass | the set of errors changes |
+
+- `patience` passes without progress or `max_passes` stop the loop with an escalation.
+- `usd` and `wall_clock` bound the run; `wall_clock` counts only the time the engine is running.
+- An llm call with an API or network error is repeated up to 2 times with backoff; beyond that the run stops with exit code 4.
+- An llm call that exhausts its per-call limit (`--max-budget-usd`, turns, timeout) counts as a red visit for implement, `ok: false` for the oracle, a new pass for holdout-gen and plan, no notes for review.
+- Escalations are written from a template in `runs/<run>/escalations/<id>.md`: what, why, evidence, how to close.
+- Closing: `heideng resolve <id> "note"` appends the note to `decisions.md` and requeues the ticket; a spec or contract gap goes through a new `heideng accept`. Then `heideng resume`.
+- `heideng resume` gives the exhausted limit a new allowance equal to its configured value; `--add-usd`, `--add-time`, `--add-passes` set a precise one.
+
+## State and resume
+
+```
+~/.heideng/<project>/
+  run.lock                    pid of the engine, run id
+  env                         app secret values
+  holdout/                    home/, <slug>/, retired/
+  plans/<slug>/               tickets, spec.lock hash
+  accept/<slug>/              staging of the accept session, with its home/
+  runs/<run>/
+    run.json                  state and cursor, written after every node (tmp + fsync + rename)
+    events.jsonl              append-only log
+    decisions.md
+    report.md
+    tickets/<id>.md
+    escalations/<id>.md
+    work/                     the work clone
+    home/                     HOME of the build scope, toolchain caches
+    verify/r<n>/              disposable checkout and its home/, deleted after verify
+    evidence/<check>/         output of each check run
+    claude/                   CLAUDE_CONFIG_DIR of the run (sessions)
+    nodes/<exec>/             prompt.md, stream.jsonl, response.json, status.json, test.log
+```
+
+- `exec` is the deterministic key of a node execution: `r<n>/<ticket>/v<n>`, `r<n>/verify`, `r<n>/review`, `holdout/v<n>`, `plan/v<n>`, `regression`, `merge-main`, `report`.
+- Ticket state in `run.json`: `queued|implementing|done|failed|escalated|blocked`, visit, base sha, commit sha.
+- `heideng resume` restarts the node in progress: an `implementing` ticket is reset to its base sha; a `done` ticket is checked with `git merge-base --is-ancestor`; verify, review and regression restart from scratch.
+- Before writing any file the engine replaces secret values with `***`.
+
+### Events
+
+One JSON object per line: `{ v, seq, ts, type, exec, ticket?, visit?, round?, data }`.
+
+| type | data |
+|---|---|
+| `run.start` | spec, `spec.lock` hash, config hash, heideng and Claude Code versions |
+| `run.end` | `merged\|stopped\|aborted\|failed`, reason |
+| `node.start` / `node.end` | kind, model; outcome, usd, duration |
+| `ticket.status` | from, to, reason |
+| `commit` | ticket, sha |
+| `verdict` | check, ACs, round, `pass\|fail\|flaky`, evidence |
+| `decision` | text, ticket |
+| `leak` | exec, path |
+| `escalation` | id, reason |
+| `stop` | loop, kind, reason |
+
+## Report
+
+`runs/<run>/report.md`, "To do for you" first.
+
+```markdown
+# <spec> - run <id>
+Outcome: merged <sha> | stopped: <reason> | aborted | failed
+Branch heideng/<slug> - round 3 - $27.80 / 50 - 5h12 / 6h - $2.10 per verified AC
+
+## To do for you
+- [ ] E-1: <reason> -> heideng resolve E-1 "..."
+- [ ] manual AC-7: <text>
+- [ ] decision (T-03): <text>
+
+## Checks
+| check | ACs | R1 | R2 | R3 |
+## Tickets
+| id | source | outcome | visits | cost |
+## Review notes
+## Isolation weakened
+## Decisions
+## Costs
+## Summary
+```
+
+`heideng stats` aggregates the reports and computes the cost per verified AC.
+
+## CLI
+
+| Command | What it does |
+|---|---|
+| `heideng init` | writes `heideng.yaml`, empty `contract.md`, `.heideng/env`; runs doctor |
+| `heideng doctor` | Requires, sandbox probe |
+| `heideng accept <spec>` | interactive session, accept check, branch and lock |
+| `heideng run <spec>` | runs the pipeline; `--until holdout\|plan\|round` stops at that boundary |
+| `heideng resume [run]` | continues a stopped run; `--add-usd`, `--add-time`, `--add-passes` |
+| `heideng resolve <id> "note"` | closes an escalation |
+| `heideng abort [run]` | stops the engine at once, branch unchanged |
+| `heideng close <run>` | releases the lock; branch and plan stay. `--delete-branch` deletes both and retires the checks |
+| `heideng status` | active run, current node, open escalations |
+| `heideng stats` | cost per run and per verified AC |
+
+During `run` stderr shows one line per event: `<time> <exec> <type> <outcome> <cost>`. At the end stdout prints outcome, budgets, "To do for you" and the path of the report.
+
+Exit codes: 0 merged or command succeeded, 1 stopped with escalation, 2 budget stop, 3 aborted, 4 engine error, 5 rejected (invalid lock, active run, failed doctor).
+
+## Config
+
+`heideng.yaml` in the repo root:
+
+```yaml
+sandbox:
+  allow: [registry.npmjs.org]                        # network for agents and product scripts
+  write: [~/.npm, ~/Library/Developer/Xcode/DerivedData]  # toolchain caches, resolved under the scope HOME
+  excluded: []                                       # commands run outside the sandbox, reported
+budgets: { usd: 50, wall_clock: 6h, patience: 2, max_passes: 10 }
+nodes:
+  accept:    { model: opus }
+  holdout:   { model: opus }
+  oracle:    { model: sonnet }
+  plan:      { model: opus }
+  implement: { model: sonnet, effort: medium }
+  review:    { model: opus }
+```
+
+The project customizes the agents through its `CLAUDE.md`, loaded by plan, implement and review. heideng's prompt names the phase; `CLAUDE.md` can point to `.heideng/plan.md`, `.heideng/implement.md`, `.heideng/review.md`.
+
+## Testability
+
+`HEIDENG_CLAUDE_BIN` replaces `claude` with a stub that returns stream-json and `structured_output`. `HEIDENG_SRT_BIN` replaces `srt`. Tests drive the heideng binary on fixture repos with real git and real scripts; the doctor probe runs against the real `claude` and `srt` in a separate suite.
