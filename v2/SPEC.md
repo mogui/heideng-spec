@@ -5,22 +5,25 @@ Heideng (黑灯工厂, heideng gongchang, "lights-out factory") is a CLI that de
 - Input: an approved spec. Output: code merged into `main` and a report.
 - A run works one spec on one project (a git repo). A project has at most one active run.
 - The product builds, runs and passes verification on the person's machine, with the person's toolchain: a web app, an API, a CLI, a library or a native macOS app go through the same pipeline.
-- Agents run only on Claude Code. Isolation is the OS sandbox of Claude Code for agents and of [`srt`](https://github.com/anthropics/sandbox-runtime) for the product's scripts. heideng uses no containers.
+- Agents run only on Claude Code. Isolation is the OS sandbox of Claude Code for agents and of [`srt`](https://github.com/anthropics/sandbox-runtime) for the product's scripts.
 
 ## References
 
 - Level 5 "dark factory" from Dan Shapiro's [The Five Levels](https://www.danshapiro.com/blog/2026/01/the-five-levels-from-spicy-autocomplete-to-the-software-factory/); holdout scenarios invisible to the agents from StrongDM's [Software Factory](https://factory.strongdm.ai).
-- Skills and vocabulary (`to-tickets`, `tdd`, `code-review`) from Matt Pocock's [skills](https://github.com/mattpocock/skills).
+- Skills the nodes run, by source:
+  - [mattpocock/skills](https://github.com/mattpocock/skills): `to-tickets`, `tdd`, `diagnosing-bugs`, `code-review`, and the working vocabulary;
+  - [obra/superpowers](https://github.com/obra/superpowers): `verification-before-completion`;
+  - [DietrichGebert/ponytail](https://github.com/DietrichGebert/ponytail): `ponytail-review`.
 - Claude Code [sandboxing](https://code.claude.com/docs/en/sandboxing) and [permissions](https://code.claude.com/docs/en/permissions).
 
 ## Principles
 
 1. **The engine decides the path, the agent does the work.** Routing is deterministic code over outcomes, counters and budgets. Inside a node the agent works with its own tool loop and returns structured output.
 2. **Every loop has two stops.** Success comes from a check other than the worker. The budget stop closes the loop with a written reason: `patience` passes without progress, the `max_passes` cap, or the run's `usd` and `wall_clock`.
-3. **The worker cannot see or change its verifier.** Holdout checks are outside the repo, in a path the OS sandbox denies to every worker process and to every product script. On a failed check the worker receives the check's intent and its output, never its code.
+3. **The worker cannot see or change its verifier.** Holdout checks live in the `holdout` zone, outside the repo, which the OS sandbox denies to the build scope: the coding agents and every script they run. On a failed check the worker receives the check's intent and its output, never its code.
 4. **Exit codes decide "done".** Build, test and holdout checks are scripts; their exit code is the verdict. LLM judges assess only what code cannot (holdout quality, code review), on a model different from the worker's.
 5. **Everything heideng runs on the product is a script.** Build, test, start, ready and every holdout check are executables with a shebang, run on the host from a known directory with a known environment.
-6. **One thing at a time.** Tickets run in sequence on one working clone. A red test has one candidate cause, the ticket in progress. There are no merges between tickets, no conflicts and no bisect.
+6. **One thing at a time.** Tickets run in sequence on one working clone, each on top of the previous ticket's commit. A red test has one candidate cause, the ticket in progress.
 7. **The node boundary is the unit of durability.** After every node the engine saves state; a crash loses only the node in progress, which restarts from scratch on resume.
 8. **The metric is cost per verified AC.** Total cost divided by the ACs whose holdout checks pass.
 
@@ -39,7 +42,8 @@ Heideng (黑灯工厂, heideng gongchang, "lights-out factory") is a CLI that de
 | Visit | One pass of a ticket through implement and test |
 | Round | Tickets in sequence until the queue is empty, then verify and review |
 | Work clone | The run's single git clone of `heideng/<slug>`, where every ticket is implemented |
-| Scope | Isolation unit of an execution: a `HOME` of its own and the only writable paths besides cwd and `TMPDIR` |
+| Scope | Isolation unit of an execution, see [Scopes](#scopes) |
+| Zone | `state`, `work` or `holdout`: a directory under `~/.heideng/` with one `<project>/` per project. Paths in this spec start with their zone: `state/runs/<run>/run.json` is `~/.heideng/state/<project>/runs/<run>/run.json` |
 | Patience | Consecutive passes without progress a loop tolerates |
 | Escalation | Problem the person must close before the run continues |
 
@@ -96,7 +100,7 @@ flowchart TD
 | implement | llm | one ticket in the work clone, sandboxed |
 | test | tool | smoke in the work clone, under `srt` |
 | verify | tool | holdout checks on a disposable checkout |
-| review | llm judge | `code-review` on the round diff |
+| review | llm judge | `code-review` and `ponytail-review` on the round diff |
 | route | tool | new round, regression or stop |
 | regression | tool | checks of active specs on the branch, minus baseline reds |
 | merge main | tool | `git merge --no-ff heideng/<slug>` |
@@ -147,7 +151,7 @@ Execution rules, the same in every node:
 
 The only step of a spec where a person takes part.
 
-1. The engine prepares `~/.heideng/<project>/accept/<slug>/` with a copy of the spec, `contract.md`, the `acceptance.md` of active specs and the accept prompt, and starts an interactive `claude` session there. The person and the agent talk directly.
+1. The engine prepares `state/accept/<slug>/` with a copy of the spec, `contract.md`, the `acceptance.md` of active specs and the accept prompt, and starts an interactive `claude` session there. The person and the agent talk directly.
 2. The agent:
    - checks the spec against the contract sections and proposes what is missing (Requires, scripts, Drive, Observe);
    - lists the product choices the spec leaves open (language and version, dependencies, normalization of input, output formats, ordering tie-breaks, error precedence) and asks the person for each;
@@ -166,13 +170,13 @@ The only step of a spec where a person takes part.
 ## Holdout
 
 ```
-~/.heideng/<project>/holdout/<slug>/
+holdout/<slug>/
   manifest.json        spec.lock hash, file hashes, oracle verdict
   <check-id>/
     check.md           ACs, Intent, Assertions
     run                executable, exit 0 = pass
     overlay/           optional, mirrors paths of the repo
-~/.heideng/<project>/holdout/retired/<slug>/<check-id>/   with the reason
+holdout/retired/<slug>/<check-id>/   with the reason
 ```
 
 - `check.md` has three sections. ACs lists the ids it covers. Intent describes the behavior in user terms and is the only text a worker may receive. Assertions describes what `run` verifies, for the oracle.
@@ -196,14 +200,14 @@ The only step of a spec where a person takes part.
   - without `.heideng/build` and `.heideng/test` on the branch, ticket `01` is the bootstrap: stack, the scripts of the contract's Run section, the overlay directories of the contract's Drive wired into the build, a skeleton and one test. Every other ticket depends on it.
 - The engine converts the files into `T-<NN>` with `deps` from "Blocked by" and `ac` from Covers, and discards every other change in the clone.
 - Graph-check: acyclic, dependencies exist, every AC (`auto` and `manual`) covered by a ticket, no ticket cites a missing AC. Errors resume the plan session.
-- The engine stores the plan in `~/.heideng/<project>/plans/<slug>/` under the `spec.lock` hash. A run with a valid plan skips the node; tickets whose commit is an ancestor of `heideng/<slug>` count as done.
+- The engine stores the plan in `state/plans/<slug>/` under the `spec.lock` hash. A run with a valid plan skips the node; tickets whose commit is an ancestor of `heideng/<slug>` count as done.
 - Execution order: topological, then by id.
 
 ## Round
 
 ### Work clone
 
-- `runs/<run>/work` is a `git clone` of the project on `heideng/<slug>`. Only the engine runs git commands that write.
+- `work/runs/<run>/work` is a `git clone` of the project on `heideng/<slug>`. Only the engine runs git commands that write.
 - Before each ticket the engine records the base sha. After a green test it commits the working tree as `<id>: <title>` and pushes to `heideng/<slug>` in the project repo.
 - The engine resets a failed or blocked ticket with `git reset --hard <base>` and `git clean -fdx -e <cache dirs>`.
 
@@ -211,7 +215,7 @@ The only step of a spec where a person takes part.
 
 - `claude -p` with cwd the work clone and the [worker sandbox](#worker-sandbox). Every visit is a new session.
 - Prompt: ticket, spec, `acceptance.md`, `contract.md`, `decisions.md`, the execution rules of the scripts. With `visit > 1`, the compressed output of the previous red test.
-- Skills: `/tdd`; `diagnosing-bugs` with `visit > 1`.
+- Skills: `/tdd` on every visit; `diagnosing-bugs` with `visit > 1`; `verification-before-completion` before returning `done`.
 - Output: `{ status: done|blocked, summary, decisions[], skipped[] }`. The agent decides alone. Where ticket and documents do not decide, it takes the most conservative choice and records it in `decisions[]`. The engine appends them to the run's `decisions.md` and to the report.
 - `blocked` marks the ticket `escalated`, its dependents `blocked`, and opens an escalation.
 - A diff that touches `.heideng/*` outside the bootstrap is a mandatory note for review.
@@ -226,7 +230,7 @@ The only step of a spec where a person takes part.
 ### Verify (tool)
 
 1. Holdout hashes match the manifest; a mismatch is an engine error.
-2. Disposable checkout of `heideng/<slug>` in `runs/<run>/verify/r<n>/`, overlays of every check of the spec copied in. The checkout holds only the overlays; check `run` is never copied into it.
+2. Disposable checkout of `heideng/<slug>` in `holdout/runs/<run>/verify/r<n>/`, overlays of every check of the spec copied in. The checkout holds only the overlays; check `run` is never copied into it.
 3. `build` on the checkout. Red: no check runs and the round ends with one ticket `F-<n>` "build red with holdout overlays". The engine removes from its build output every line that cites an overlay path or quotes overlay content, so the ticket keeps product files, missing symbols and compiler messages.
 4. Each check in turn: `start` and `ready` when present, then `run` executed from its own holdout directory with `HEIDENG_APP_DIR` set to the checkout, stop. The exit code is the verdict.
 5. A red check runs once more. Red then green is `flaky`, a verdict of its own that counts as fail.
@@ -237,12 +241,12 @@ Verdicts become fix tickets:
 - Failed checks whose first error line is identical share one ticket.
 - A check that fails in the next round again produces a new ticket with `supersedes` and the `summary` of the previous one.
 
-The engine deletes the checkout and its scope home after the step. Nothing from verify returns to the work clone.
+The engine deletes the checkout and its scope home after the step. Verify reaches the work clone only through fix tickets.
 
 ### Review
 
 - One `claude -p` session per round, model different from implement, on a clone of `heideng/<slug>`. The engine discards the changes it makes.
-- `code-review` on `base_round..heideng/<slug>`, with spec and `acceptance.md`. Output `{ notes: [{ axis: spec|standards|lean, severity: blocking|minor, msg, files[] }] }`.
+- `code-review` on `base_round..heideng/<slug>`, with spec and `acceptance.md`; `ponytail-review` feeds the `lean` axis. Output `{ notes: [{ axis: spec|standards|lean, severity: blocking|minor, msg, files[] }] }`.
 - Round 1: every `blocking` note becomes `R-<n>`. Later rounds: only `blocking` notes on the `spec` axis. Other notes go to the report.
 
 ### Route
@@ -259,7 +263,7 @@ The engine deletes the checkout and its scope home after the step. Nothing from 
 
 ### Docs
 
-Runs once, after the merge, on a clone of `main` in `runs/<run>/docs/`.
+Runs once, after the merge, on a clone of `main` in `work/runs/<run>/docs/`.
 
 - `claude -p` with the [worker sandbox](#worker-sandbox), model from `nodes.docs`, on the clone. Prompt: spec, `acceptance.md`, `contract.md`, `decisions.md`, the merge diff `<merge base>..main` and the paths of `docs.paths`.
 - The agent updates the documentation under `docs.paths` for the merged change: what the product does now, how to run and use it, the decisions that affect a user. It creates the files that do not exist. Output `{ summary, files[] }`.
@@ -271,7 +275,7 @@ Runs once, after the merge, on a clone of `main` in `runs/<run>/docs/`.
 
 ### Worker sandbox
 
-Every llm node runs `claude -p` on the host with settings generated per execution and passed with `--settings`, `--setting-sources ""`, `--permission-mode dontAsk`, `--allowedTools` of the node, `CLAUDE_CONFIG_DIR=runs/<run>/claude/`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
+Every llm node runs `claude -p` on the host with settings generated per execution and passed with `--settings`, `--setting-sources ""`, `--permission-mode dontAsk`, `--allowedTools` of the node, `CLAUDE_CONFIG_DIR=state/runs/<run>/claude/`, `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`.
 
 ```json
 {
@@ -281,27 +285,26 @@ Every llm node runs `claude -p` on the host with settings generated per executio
     "allowUnsandboxedCommands": false,
     "excludedCommands": [],
     "filesystem": {
-      "denyRead": ["~/.heideng", "<project repo>"],
+      "denyRead": ["~/.heideng/state", "<zones of the other scopes>", "<project repo>"],
       "allowRead": ["<cwd>", "<scope home>"],
       "allowWrite": ["<scope home>", "<sandbox.write from heideng.yaml, under the scope home>"]
     },
     "network": { "allowedDomains": ["<sandbox.allow from heideng.yaml>"], "allowLocalBinding": true }
   },
   "permissions": {
-    "deny": ["Read(~/.heideng/**)", "Edit(~/.heideng/**)", "WebFetch", "WebSearch"]
+    "deny": ["Read(<each denied zone>/**)", "Edit(<each denied zone>/**)", "WebFetch", "WebSearch"]
   }
 }
 ```
 
-- When read rules overlap, the narrower path wins. `allowRead: <cwd>` therefore reopens the work clone inside the denied `~/.heideng`, and a `denyRead` inside an allowed directory stays denied. The doctor probe verifies both directions.
-- holdout-gen and the oracle run with cwd `holdout/<slug>/`, re-allowed under the heideng home; the project repo and the runs stay denied.
+- `allowRead` reopens reading inside a denied directory; writing stays closed there. Every writable path of an execution (cwd, scope `HOME`, `sandbox.write`, `HEIDENG_DATA`, `HEIDENG_EVIDENCE`) therefore lies in the zone of its scope. A `denyRead` inside an allowed directory stays denied. The doctor probe verifies both directions.
 - `excludedCommands` from `heideng.yaml` run outside the sandbox. The report lists them under "Isolation weakened".
 
 ### Product sandbox
 
 The engine runs every script of the product (build, test, start, ready) and every check `run` through `srt --settings <file>` with the same filesystem and network rules. Code written by an agent therefore runs with the same denials as the agent.
 
-A check `run` executes with `holdout/<slug>/<id>/` re-allowed read-only and the same write rules as the checkout it drives. Product code it loads (a test runner, a compiled overlay) can therefore read that check and write only inside the verify scope, which the engine deletes with the checkout.
+A check `run` executes from `holdout/<slug>/<id>/` with the write rules of the checkout it drives. Product code it loads (a test runner, a compiled overlay) can therefore read that check and write only inside the verify scope, which the engine deletes with the checkout.
 
 ### Scopes
 
@@ -309,12 +312,18 @@ Every execution belongs to a scope. The scope owns a `HOME` and the only writabl
 
 | Scope | `HOME` | Executions | Lifetime |
 |---|---|---|---|
-| build | `runs/<run>/home/` | implement, plan, review, docs, the test step | the run |
-| verify | `runs/<run>/verify/r<n>/home/` | `build`, `start`, `ready` and check `run` in verify, baseline and regression | the step |
+| build | `work/runs/<run>/home/` | implement, plan, review, docs, report, the test step, merge | the run |
+| verify | `holdout/runs/<run>/verify/r<n>/home/` | `build`, `start`, `ready` and check `run` in verify, baseline and regression | the step |
 | holdout | `holdout/home/` | holdout-gen, oracle | until the checks change |
-| accept | `accept/<slug>/home/` | the accept session | the accept |
+| accept | `state/accept/<slug>/home/` | the accept session, outside the sandbox | the accept |
 
-The build scope cannot read anything written in the verify scope. The two share no directory, nothing writes in the real home, and the build scope reads `~/.heideng` only in its cwd and its home.
+Each sandboxed scope writes in one zone and is denied the others:
+
+| Zone | Contents | Writable by | Denied to |
+|---|---|---|---|
+| `state` | engine state, secret values, canary, plans, accept staging, node artifacts | the engine | every sandboxed scope |
+| `work` | work clone, plan, review, docs and merge clones, build `HOME`, data and evidence of the build scope's smokes | build scope | holdout and verify scopes |
+| `holdout` | checks, holdout `HOME`, verify checkouts and their `HOME`, check evidence | holdout and verify scopes | build scope |
 
 ### Audit
 
@@ -324,15 +333,15 @@ After every llm node the engine scans the tool calls in `stream.jsonl` for paths
 
 `heideng doctor` runs at `init`, at `accept` and at the start of every run:
 - every Requires command, on the host, under `srt` and inside a probe Claude Code session with the worker settings;
-- the probe session runs `probe.sh` in its cwd, which writes `result.json`: a canary file under `~/.heideng/<project>/` is unreadable with `cat` and with `python3`, a file in the cwd is readable, a write to the real home fails, a write under the scope `HOME` succeeds, a server on `localhost` answers;
+- one probe session per zone a scope writes (`work/doctor/` with the build scope rules, `holdout/doctor/` with the holdout scope rules) runs `probe.sh` in its cwd, which writes `result.json`: a canary file under `state/` is unreadable with `cat` and with `python3`, a file in the cwd is readable, a write to the real home fails, a write under the scope `HOME` succeeds, a server on `localhost` answers;
 - Claude Code denies the probe's Read tool call on the canary.
 
 A red doctor stops before any node, with the failing command and the setting that resolves it (`sandbox.write`, `sandbox.allow`, `sandbox.excluded`).
 
 ### Credentials and secrets
 
-- Claude Code authenticates with the person's login or `ANTHROPIC_API_KEY`.
-- App secrets: names in `.heideng/env`, values in `~/.heideng/<project>/env`. The engine injects the values into `start`, `ready` and check `run`. Agents, `build` and `test` see only the names, so `build` and `test` give the worker and the engine the same result.
+- Claude Code authenticates from the environment of `heideng`: `CLAUDE_CODE_OAUTH_TOKEN` (from `claude setup-token`) or `ANTHROPIC_API_KEY`, the only credential that reaches a run's fresh `CLAUDE_CONFIG_DIR`.
+- App secrets: names in `.heideng/env`, values in `state/env`. The engine injects the values into `start`, `ready` and check `run`. Agents, `build` and `test` see only the names, so `build` and `test` give the worker and the engine the same result.
 
 ## Stops, budgets and escalations
 
@@ -347,17 +356,17 @@ A red doctor stops before any node, with the failing command and the setting tha
 - `usd` and `wall_clock` bound the run; `wall_clock` counts only the time the engine is running.
 - The engine repeats an llm call with an API or network error up to 2 times with backoff. Beyond that the run stops with exit code 4.
 - An llm call that exhausts its per-call limit (`--max-budget-usd`, turns, timeout) counts as a red visit for implement, `ok: false` for the oracle, a new pass for holdout-gen and plan, no notes for review.
-- The engine writes each escalation from a template in `runs/<run>/escalations/<id>.md`, with what, why, evidence and how to close.
+- The engine writes each escalation from a template in `state/runs/<run>/escalations/<id>.md`, with what, why, evidence and how to close.
 - Closing: `heideng resolve <id> "note"` appends the note to `decisions.md` and requeues the ticket; a spec or contract gap goes through a new `heideng accept`. Then `heideng resume`.
 - `heideng resume` gives the exhausted limit a new allowance equal to its configured value; `--add-usd`, `--add-time`, `--add-passes` set a precise one.
 
 ## State and resume
 
 ```
-~/.heideng/<project>/
+~/.heideng/state/<project>/
   run.lock                    pid of the engine, run id
   env                         app secret values
-  holdout/                    home/, <slug>/, retired/
+  canary                      read by the doctor probe
   plans/<slug>/               tickets, spec.lock hash
   accept/<slug>/              staging of the accept session, with its home/
   runs/<run>/
@@ -367,13 +376,25 @@ A red doctor stops before any node, with the failing command and the setting tha
     report.md
     tickets/<id>.md
     escalations/<id>.md
-    work/                     the work clone
-    docs/                     clone of main for the docs node, deleted after the step
-    home/                     HOME of the build scope, toolchain caches
-    verify/r<n>/              disposable checkout and its home/, deleted after verify
-    evidence/<check>/         output of each check run
     claude/                   CLAUDE_CONFIG_DIR of the run (sessions)
-    nodes/<exec>/             prompt.md, stream.jsonl, response.json, status.json, test.log
+    nodes/<exec>/             prompt.md, stream.jsonl, response.json, status.json, test.log, settings
+~/.heideng/work/<project>/
+  doctor/                     cwd and HOME of the doctor probe for the build scope
+  runs/<run>/
+    work/                     the work clone
+    plan/, review/r<n>/       clones of the branch for plan and review
+    report/                   cwd of the report node
+    docs/, merge/             clones of main for the docs node and the merge, deleted after the step
+    home/                     HOME of the build scope, toolchain caches
+    scripts/<exec>/           HEIDENG_DATA and HEIDENG_EVIDENCE of the smokes of the build scope (test step, docs, merge)
+~/.heideng/holdout/<project>/
+  home/                       HOME of the holdout scope
+  <slug>/, retired/           checks
+  doctor/                     cwd and HOME of the doctor probe for the holdout scope
+  runs/<run>/
+    verify/r<n>/              disposable checkout and its home/, deleted after verify
+    verify-work/r<n>/         HEIDENG_DATA of the verify scope
+    evidence/<check>/         output of each check run
 ```
 
 - `exec` is the deterministic key of a node execution: `r<n>/<ticket>/v<n>`, `r<n>/verify`, `r<n>/review`, `holdout/v<n>`, `plan/v<n>`, `regression`, `merge-main`, `docs`, `report`.
@@ -400,7 +421,7 @@ One JSON object per line: `{ v, seq, ts, type, exec, ticket?, visit?, round?, da
 
 ## Report
 
-`runs/<run>/report.md`, "To do for you" first.
+`state/runs/<run>/report.md`, "To do for you" first.
 
 ```markdown
 # <spec> - run <id>
