@@ -36,11 +36,11 @@ Heideng (黑灯工厂, heideng gongchang, "lights-out factory") is a CLI that de
 | Contract | `contract.md`: host prerequisites, product scripts, how checks drive and observe the product |
 | Check | Holdout unit: `check.md` (ACs, intent, assertions) plus an executable `run`, optional `overlay/` |
 | Overlay | Files a check adds to a disposable checkout before the build (test files compiled against the product) |
-| Smoke | Engine step: `build`, `test`, `test-host` when listed in `sandbox.unsandboxed`, then `start` and `ready` when the product has them. Part of every test step and of verify |
-| Ticket | Unit of work. `T-<NN>` from the plan, `F-<n>` from failed checks, `R-<n>` from blocking review notes |
+| Smoke | Engine step: `build`, `test`, `test-host` when the step runs it and `sandbox.unsandboxed` lists it, then `start` and `ready` when the product has them. Part of every test step, of the host step, of merge main and of docs. The test step runs `test-host` only for a ticket that fixes a red host step |
+| Ticket | Unit of work. `T-<NN>` from the plan, `F-<n>` from failed checks or a red host step, `R-<n>` from blocking review notes |
 | Plan | Ticket list approved by graph-check for one `spec.lock` version |
 | Visit | One pass of a ticket through implement and test |
-| Round | Tickets in sequence until the queue is empty, then verify and review |
+| Round | Tickets in sequence until the queue is empty, then host, verify and review |
 | Work clone | The run's single git clone of `heideng/<slug>`, where every ticket is implemented |
 | Scope | Isolation unit of a sandboxed execution, see [Scopes](#scopes) |
 | Zone | `state`, `work` or `holdout`: a directory under `~/.heideng/` with one `<project>/` per project. Paths in this spec start with their zone: `state/runs/<run>/run.json` is `~/.heideng/state/<project>/runs/<run>/run.json` |
@@ -71,7 +71,9 @@ flowchart TD
         test -->|"red: visit++"| impl
         test -->|green| commit["commit + push to heideng/slug"]
         commit --> queue
-        queue -->|empty| verify{"verify: disposable checkout, overlays, smoke, checks"}
+        queue -->|empty| host{"host: smoke with test-host"}
+        host -->|"red: F ticket"| queue
+        host -->|green| verify{"verify: disposable checkout, overlays, build, checks"}
         verify --> review["review"]
         review --> route{route}
     end
@@ -99,6 +101,7 @@ flowchart TD
 | graph-check | tool | acyclic, dependencies exist, every AC covered |
 | implement | llm | one ticket in the work clone, sandboxed |
 | test | tool | smoke in the work clone, under `srt` |
+| host | tool | smoke with `test-host` in the work clone, once the queue is empty |
 | verify | tool | holdout checks on a disposable checkout |
 | review | llm judge | `code-review` and `ponytail-review` on the round diff |
 | route | tool | new round, regression or stop |
@@ -125,7 +128,7 @@ The product exposes itself to heideng through scripts in the repo.
 
 Execution rules, the same in every node:
 - Run through the shebang, from the root of the checkout, under `srt` with the [product sandbox](#product-sandbox). A script listed in `sandbox.unsandboxed` runs without `srt`, with the same environment; the report lists it under "Isolation weakened".
-- `.heideng/test-host` holds the tests the sandbox cannot run (a test runner service, launching the app, a pseudo-terminal); every test that runs in the sandbox stays in `.heideng/test`. The engine runs it only when `sandbox.unsandboxed` lists `test-host`; otherwise smoke skips it and "To do for you" asks the person to add it. The worker writes the split and cannot run `test-host` itself; a sandbox restriction on tests makes it split them, never return blocked. The resolve session proposes the same split for an escalation caused by such a restriction.
+- `.heideng/test-host` holds the tests the sandbox cannot run (a test runner service, launching the app, a pseudo-terminal); every test that runs in the sandbox stays in `.heideng/test`. The engine runs it only when `sandbox.unsandboxed` lists `test-host`, in the [host step](#host-tool), in the test step of a ticket that fixes a red host step, in merge main and in docs; otherwise smoke skips it and "To do for you" asks the person to add it. The worker writes the split and cannot run `test-host` itself; a sandbox restriction on tests makes it split them, never return blocked. The resolve session proposes the same split for an escalation caused by such a restriction.
 - Environment: `HEIDENG_PORT` (a free port the engine picks), `HEIDENG_DATA` (an empty directory per execution), `HEIDENG_EVIDENCE` (directory for files the run keeps), `HOME` set to the [scope home](#scopes), [app secrets](#credentials-and-secrets) by script.
 - Timeout 20 minutes per script; a timeout is red with the note "timeout".
 - `start` runs in its own process group; the engine polls `ready` every second for 60 seconds, then kills the group at the end of the step.
@@ -230,10 +233,17 @@ holdout/retired/<slug>/<check-id>/   with the reason
 
 ### Test (tool)
 
-- Smoke in the work clone under `srt`.
+- Smoke in the work clone under `srt`. `test-host` runs only for a ticket whose `checks` hold `test-host`.
 - Green: commit and next ticket.
 - Red: the visit counter increments and implement runs again with the output compressed without an llm (failed tests with message and stack, repeated lines collapsed, otherwise the tail).
 - `patience` visits without [progress](#stops-budgets-and-escalations) make the ticket `failed`: reset, dependents `blocked`, escalation of kind `ticket`, next runnable ticket.
+
+### Host (tool)
+
+- Runs when the queue is empty, no ticket is stuck and no escalation is open, when `.heideng/test-host` exists and `sandbox.unsandboxed` lists it.
+- Smoke with `test-host` in the work clone, exec `r<n>/test-host`. The round keeps the head it went green on; the same head does not run it again, and the green test step of a `test-host` ticket counts as green on its commit.
+- Green: verify.
+- Red: one ticket `F-<n>` "smoke red at <script> with .heideng/test-host", `checks: [test-host]`, with the last 40 lines of the output, queued in the same round. Its visits run `test-host` in the test step; patience and `max_passes` apply as for every ticket.
 
 ### Verify (tool)
 
@@ -353,7 +363,7 @@ Every sandboxed execution belongs to a scope. The scope owns a `HOME` and the on
 
 | Scope | `HOME` | Executions | Lifetime |
 |---|---|---|---|
-| build | `work/runs/<run>/home/` | implement, plan, review, docs, report, the test step, merge | the run |
+| build | `work/runs/<run>/home/` | implement, plan, review, docs, report, the test and host steps, merge | the run |
 | verify | `holdout/runs/<run>/verify/r<n>/home/` | `build`, `start`, `ready` and check `run` in verify, baseline and regression | the step |
 | holdout | `holdout/home/` | holdout-gen, oracle | until the checks change |
 
@@ -451,7 +461,7 @@ The person closes an escalation together with an agent, which reads the state fi
     report/                   cwd of the report node
     docs/, merge/             clones of main for the docs node and the merge, deleted after the step
     home/                     HOME of the build scope, toolchain caches
-    scripts/<exec>/           HEIDENG_DATA and HEIDENG_EVIDENCE of the smokes of the build scope (test step, docs, merge)
+    scripts/<exec>/           HEIDENG_DATA and HEIDENG_EVIDENCE of the smokes of the build scope (test step, host step, docs, merge)
 ~/.heideng/holdout/<project>/
   home/                       HOME of the holdout scope
   <slug>/, retired/           checks
@@ -462,8 +472,9 @@ The person closes an escalation together with an agent, which reads the state fi
     evidence/<check>/         output of each check run
 ```
 
-- `exec` is the deterministic key of a node execution: `r<n>/<ticket>/v<n>`, `r<n>/verify`, `r<n>/review`, `holdout/v<n>`, `plan/v<n>`, `regression`, `merge-main`, `docs`, `report`.
+- `exec` is the deterministic key of a node execution: `r<n>/<ticket>/v<n>`, `r<n>/test-host`, `r<n>/verify`, `r<n>/review`, `holdout/v<n>`, `plan/v<n>`, `regression`, `merge-main`, `docs`, `report`.
 - Ticket state in `run.json`: `queued|implementing|done|failed|escalated|blocked`, visit, base sha, commit sha.
+- Ctrl-C (SIGINT) on the engine kills the node in progress and ends the run as `stopped` with reason `interrupted`, exit code 3; `heideng resume` continues it. SIGTERM, which `heideng abort` sends, ends it as `aborted`.
 - `heideng resume` restarts the node in progress. It resets an `implementing` ticket to its base sha, checks a `done` ticket with `git merge-base --is-ancestor`, and restarts verify, review and regression from scratch.
 - Before writing any file the engine replaces secret values with `***`.
 
@@ -522,14 +533,14 @@ Branch heideng/<slug> - round 3 - $27.80 / 50 - 5h12 / 6h - $2.10 per verified A
 | `heideng run <spec>` | runs the pipeline; `--until holdout\|plan\|round\|merge` stops at that boundary |
 | `heideng resume [run]` | continues a stopped run; `--add-usd`, `--add-time`, `--add-passes` |
 | `heideng resolve <id>` | interactive session, resolve check, closure of the escalation, resume on `y` |
-| `heideng abort [run]` | stops the engine at once, branch unchanged |
+| `heideng abort [run]` | stops the engine at once and ends the run as `aborted`, branch unchanged; an aborted run cannot be resumed |
 | `heideng close <run>` | releases the lock; branch and plan stay. `--delete-branch` deletes both and retires the checks |
 | `heideng status` | active run, current node, open escalations |
 | `heideng stats` | cost per run and per verified AC |
 
 During `run` and `resume`, on a terminal, stderr shows an in-place view redrawn as events arrive: the phase graph `holdout -> baseline -> plan -> rounds -> merge -> docs -> report` with a spinner on the active phase, the node in progress (what it does, exec, model, elapsed, retries), the tickets with their state, spent against limits, and the last events. Off a terminal stderr shows one line per event: `<time> <exec> <type> <outcome> <cost>`. At the end stdout prints outcome, budgets, "To do for you" and the path of the report.
 
-Exit codes: 0 merged or command succeeded, 1 stopped with escalation, 2 budget stop, 3 aborted, 4 engine error, 5 rejected (invalid lock, active run, failed doctor).
+Exit codes: 0 merged or command succeeded, 1 stopped with escalation, 2 budget stop, 3 aborted or interrupted, 4 engine error, 5 rejected (invalid lock, active run, failed doctor).
 
 ## Config
 
